@@ -1,0 +1,28 @@
+# Qt
+build/
+*.user
+*.user.*
+debug/
+release/
+Makefile
+Makefile.Debug
+Makefile.Release
+object_script.*.Release
+object_script.*.Debug
+*_plugin_import.cpp
+/.qmake.stash
+/.qmake.cache
+ui_*.h
+moc_*.cpp
+qrc_*.cpp
+
+# Binaries and Models
+*.dll
+*.exe
+*.onnx
+
+# IDEs
+.vscode/
+.idea/
+.qtcreator/
+.claude/

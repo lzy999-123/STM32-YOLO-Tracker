@@ -46,21 +46,57 @@ DnnThread::DnnThread(QObject *parent) : QThread(parent) {
     };
 
     try {
-        m_yoloNet = cv::dnn::readNetFromONNX("yolov8n.onnx");
-        if (m_yoloNet.empty()) {
-            qDebug() << "YOLO 模型加载失败: yolov8n.onnx 为空";
-        } else {
-            m_yoloNet.setPreferableBackend(cv::dnn::DNN_BACKEND_OPENCV);
-            m_yoloNet.setPreferableTarget(cv::dnn::DNN_TARGET_OPENCL); // 尝试使用集成显卡(OpenCL)加速
+        m_ortEnv = Ort::Env(ORT_LOGGING_LEVEL_WARNING, "YOLOv8");
+        Ort::SessionOptions sessionOptions;
+        sessionOptions.SetIntraOpNumThreads(1);
+
+        try {
+            OrtCUDAProviderOptions cuda_options;
+            cuda_options.device_id = 0;
+            sessionOptions.AppendExecutionProvider_CUDA(cuda_options);
+            qDebug() << "成功配置 ONNX Runtime CUDA 执行器!";
+        } catch (...) {
+            qDebug() << "配置 CUDA 失败，将回退到 CPU!";
         }
+        std::wstring modelPath = L"yolov8n.onnx";
+        m_ortSession = new Ort::Session(m_ortEnv, modelPath.c_str(), sessionOptions);
+
+        Ort::AllocatorWithDefaultOptions allocator;
+        m_inputNodeNamesStr.clear();
+        m_inputNodeNames.clear();
+        for (size_t i = 0; i < m_ortSession->GetInputCount(); i++) {
+            auto input_name = m_ortSession->GetInputNameAllocated(i, allocator);
+            m_inputNodeNamesStr.push_back(input_name.get());
+        }
+        for (const auto& s : m_inputNodeNamesStr) {
+            m_inputNodeNames.push_back(s.c_str());
+        }
+
+        m_outputNodeNamesStr.clear();
+        m_outputNodeNames.clear();
+        for (size_t i = 0; i < m_ortSession->GetOutputCount(); i++) {
+            auto output_name = m_ortSession->GetOutputNameAllocated(i, allocator);
+            m_outputNodeNamesStr.push_back(output_name.get());
+        }
+        for (const auto& s : m_outputNodeNamesStr) {
+            m_outputNodeNames.push_back(s.c_str());
+        }
+        
+        qDebug() << "ONNX Runtime 模型加载成功!";
+    } catch (const Ort::Exception& e) {
+        qDebug() << "ONNX Runtime 加载异常: " << e.what();
     } catch (const std::exception& e) {
-        qDebug() << "YOLO 加载异常: " << e.what();
+        qDebug() << "标准异常: " << e.what();
     }
 }
 
 DnnThread::~DnnThread() {
     requestInterruption();
     wait();
+    if (m_ortSession) {
+        delete m_ortSession;
+        m_ortSession = nullptr;
+    }
 }
 
 bool DnnThread::isBusy() {
@@ -127,26 +163,25 @@ void DnnThread::run() {
             }
         }
 
-        if (processFrame.empty() || m_yoloNet.empty()) {
+        if (processFrame.empty() || m_ortSession == nullptr) {
             QMutexLocker locker(&m_mutex);
             m_isComputing = false;
             continue;
         }
 
-        // YOLO 前向推理
+        // ------------------ ONNX Runtime 前向推理 ------------------
         cv::Mat blob;
         cv::dnn::blobFromImage(processFrame, blob, 1.0 / 255.0, cv::Size(640, 640), cv::Scalar(), true, false);
-        m_yoloNet.setInput(blob);
-        std::vector<cv::Mat> outputs;
+        
+        std::vector<int64_t> input_dims = {1, 3, 640, 640};
+        auto memory_info = Ort::MemoryInfo::CreateCpu(OrtDeviceAllocator, OrtMemTypeCPU);
+        Ort::Value input_tensor = Ort::Value::CreateTensor<float>(memory_info, (float*)blob.data, blob.total(), input_dims.data(), input_dims.size());
+
+        std::vector<Ort::Value> output_tensors;
         try {
-            m_yoloNet.forward(outputs, m_yoloNet.getUnconnectedOutLayersNames());
-        } catch (const cv::Exception& e) {
-            qDebug() << "YOLO 推理发生 cv::Exception:" << e.what();
-            QMutexLocker locker(&m_mutex);
-            m_isComputing = false;
-            continue;
-        } catch (const std::exception& e) {
-            qDebug() << "YOLO 推理发生 std::exception:" << e.what();
+            output_tensors = m_ortSession->Run(Ort::RunOptions{nullptr}, m_inputNodeNames.data(), &input_tensor, 1, m_outputNodeNames.data(), 1);
+        } catch (const Ort::Exception& e) {
+            qDebug() << "YOLO 推理发生 Ort::Exception:" << e.what();
             QMutexLocker locker(&m_mutex);
             m_isComputing = false;
             continue;
@@ -157,12 +192,13 @@ void DnnThread::run() {
             continue;
         }
 
-        cv::Mat output = outputs[0];
+        float* output_data = output_tensors[0].GetTensorMutableData<float>();
+        auto output_info = output_tensors[0].GetTensorTypeAndShapeInfo();
+        auto output_dims = output_info.GetShape();
         
-        // 防御性转换：将 N 维张量 (如 1x84x8400) 强制转换为 2D 矩阵，防止 cv::transpose 断言崩溃
-        int r = output.size[output.dims - 2];
-        int c = output.size[output.dims - 1];
-        cv::Mat output2d(r, c, CV_32F, output.ptr<float>());
+        int r = output_dims[1]; // 84
+        int c = output_dims[2]; // 8400
+        cv::Mat output2d(r, c, CV_32F, output_data);
         
         // 自动识别正确的行列方向：YOLOv8 框数肯定是几千 (比如 8400)，特征数是几十 (比如 84)
         cv::Mat outputT;
@@ -170,18 +206,9 @@ void DnnThread::run() {
             outputT = output2d;
         } else {
             outputT = output2d.t(); // 现在 output2d 绝对是 2D 的，转置不会再崩溃
+            outputT = outputT.clone(); // 极其关键：转置后必须深拷贝，否则内存不连续会导致下面读取全错！
         }
 
-        // 打印所有的输出张量维度，用于诊断模型结构
-        QString allShapes = "";
-        for (size_t i = 0; i < outputs.size(); i++) {
-            allShapes += "[";
-            for (int j = 0; j < outputs[i].dims; j++) {
-                allShapes += QString::number(outputs[i].size[j]) + (j < outputs[i].dims - 1 ? "x" : "");
-            }
-            allShapes += "] ";
-        }
-        qDebug() << "YOLO 输出张量诊断: 共" << outputs.size() << "个张量. 形状:" << allShapes;
 
         // 防崩溃：确保张量特征维度至少包含 cx,cy,w,h 以及至少一个类别的分数
         if (outputT.cols < 5 || outputT.rows < 10) {
@@ -202,12 +229,18 @@ void DnnThread::run() {
         for (int i = 0; i < outputT.rows; ++i) {
             float* row = outputT.ptr<float>(i);
             float* classes_scores = row + 4;
-            cv::Mat scores(1, num_classes, CV_32F, classes_scores);
-            cv::Point class_id;
-            double max_class_score;
-            cv::minMaxLoc(scores, 0, &max_class_score, 0, &class_id);
+            
+            // 极速循环：替代原来耗时的 cv::minMaxLoc (8400次调用会拖慢近15毫秒！)
+            float max_class_score = classes_scores[0];
+            int best_class_id = 0;
+            for (int c = 1; c < num_classes; ++c) {
+                if (classes_scores[c] > max_class_score) {
+                    max_class_score = classes_scores[c];
+                    best_class_id = c;
+                }
+            }
 
-            if (max_class_score > 0.25) {
+            if (max_class_score > 0.25f) {
                 float cx = row[0];
                 float cy = row[1];
                 float w = row[2];
@@ -226,7 +259,7 @@ void DnnThread::run() {
                 int width = int(w * x_factor);
                 int height = int(h * y_factor);
 
-                classIds.push_back(class_id.x);
+                classIds.push_back(best_class_id);
                 confidences.push_back((float)max_class_score);
                 boxes.push_back(cv::Rect(left, top, width, height));
             }
@@ -1003,30 +1036,16 @@ void MainWindow::onDnnResultReceived(const cv::Rect2d &dnnRect, bool success, co
     }
 
     const int DEAD_ZONE = 18;
-    m_isTargetTracked = (success && isReasonable);
+    bool currentSuccess = (success && isReasonable);
 
     static int lostFrameCount = 0;
 
-    if (m_isTargetTracked) {
+    if (currentSuccess) {
+        m_isTargetTracked = true;
         lostFrameCount = 0; // 目标找回，清零
 
-        if (m_trackedRect.width == 0 || m_trackedRect.height == 0) {
-            m_trackedRect = dnnRect;
-        } else {
-            double new_cx = dnnRect.x + dnnRect.width / 2.0;
-            double new_cy = dnnRect.y + dnnRect.height / 2.0;
-            double old_cx = m_trackedRect.x + m_trackedRect.width / 2.0;
-            double old_cy = m_trackedRect.y + m_trackedRect.height / 2.0;
-            double dist = sqrt((new_cx - old_cx) * (new_cx - old_cx) + (new_cy - old_cy) * (new_cy - old_cy));
-            
-            double dynamicAlpha = 0.5 + (dist / 30.0) * 0.5;
-            if (dynamicAlpha > 1.0) dynamicAlpha = 1.0;
-            
-            m_trackedRect.x = dynamicAlpha * dnnRect.x + (1.0 - dynamicAlpha) * m_trackedRect.x;
-            m_trackedRect.y = dynamicAlpha * dnnRect.y + (1.0 - dynamicAlpha) * m_trackedRect.y;
-            m_trackedRect.width = dynamicAlpha * dnnRect.width + (1.0 - dynamicAlpha) * m_trackedRect.width;
-            m_trackedRect.height = dynamicAlpha * dnnRect.height + (1.0 - dynamicAlpha) * m_trackedRect.height;
-        }
+        // 移除平滑滤波，让框框直接等于深度学习的输出，实现“牢牢锁定”而没有延迟跟随
+        m_trackedRect = dnnRect;
 
         int cx = m_frameSize.width() / 2;
         int cy = m_frameSize.height() / 2;
@@ -1042,17 +1061,24 @@ void MainWindow::onDnnResultReceived(const cv::Rect2d &dnnRect, bool success, co
         m_offsetX = offset_x;
         m_offsetY = offset_y;
     } else {
-        m_offsetX = 0;
-        m_offsetY = 0;
         lostFrameCount++;
+        const int MAX_LOST_TOLERANCE = 15; // 容忍15帧（约0.5秒）的识别丢失
 
-        // 刚刚丢失时的响应：立刻清除框，并输出日志提醒
-        if (lostFrameCount == 1) {
-            if (ui->plainTextEdit_2) {
-                ui->plainTextEdit_2->appendPlainText("【警告】目标丢失！已清除追踪框，正在尝试找回...");
+        if (lostFrameCount > MAX_LOST_TOLERANCE) {
+            m_isTargetTracked = false;
+            m_offsetX = 0;
+            m_offsetY = 0;
+
+            // 彻底丢失时的响应：清除框，并输出日志提醒
+            if (lostFrameCount == MAX_LOST_TOLERANCE + 1) {
+                if (ui->plainTextEdit_2) {
+                    ui->plainTextEdit_2->appendPlainText("【警告】目标丢失！已清除追踪框，正在尝试找回...");
+                }
+                m_trackedRect = cv::Rect2d(); // 立刻将宽和高变成0，界面不再画框
             }
-            m_trackedRect = cv::Rect2d(); // 立刻将宽和高变成0，界面不再画框
         }
+        // 如果 lostFrameCount <= MAX_LOST_TOLERANCE，则保持 m_isTargetTracked 为 true，
+        // 且保留 m_trackedRect、m_offsetX、m_offsetY 的上一次值，起到防抖和惯性预测的作用。
     }
 
 

@@ -45,7 +45,9 @@ LIBS += -L$$OPENCV_DIR/x64/vc17/lib \
         -lopencv_dnn4120d      # 接入DNN
 
 
+# ========== 追加：ONNX Runtime 配置 ==========
+ONNXRUNTIME_DIR = D:/onnxruntime_gpu/onnxruntime-win-x64-gpu-1.20.1
 
-
-
+INCLUDEPATH += $$ONNXRUNTIME_DIR/include
+LIBS += -L$$ONNXRUNTIME_DIR/lib -lonnxruntime -lonnxruntime_providers_cuda -lonnxruntime_providers_shared
 

@@ -21,6 +21,7 @@
 
 #include <opencv2/opencv.hpp>
 #include <opencv2/dnn.hpp>
+#include <onnxruntime_cxx_api.h>
 #include <vector>
 #include <string>
 
@@ -45,7 +46,7 @@ public:
     void updateDnn(const cv::Mat &frame);
     void stopDnn();
     bool isBusy(); // 判断大脑是否正在忙碌
-    bool isNetEmpty() { return m_yoloNet.empty(); }
+    bool isNetEmpty() { return m_ortSession == nullptr; }
 
 signals:
     void dnnTrackedResult(const cv::Rect2d &rect, bool success, const QString &className = "");
@@ -55,7 +56,12 @@ protected:
 
 private:
     QMutex m_mutex;
-    cv::dnn::Net m_yoloNet;               // YOLO网络模型
+    Ort::Env m_ortEnv{nullptr};
+    Ort::Session* m_ortSession = nullptr;
+    std::vector<const char*> m_inputNodeNames;
+    std::vector<const char*> m_outputNodeNames;
+    std::vector<std::string> m_inputNodeNamesStr;
+    std::vector<std::string> m_outputNodeNamesStr;
     int m_lockedClassId;                  // 锁定的目标类别ID
     bool m_useYolo;                       // 是否使用YOLO跟踪
     std::vector<std::string> m_classNames;// COCO类别名称列表

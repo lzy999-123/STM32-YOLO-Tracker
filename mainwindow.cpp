@@ -48,7 +48,7 @@ DnnThread::DnnThread(QObject *parent) : QThread(parent) {
     try {
         m_ortEnv = Ort::Env(ORT_LOGGING_LEVEL_WARNING, "YOLOv8");
         Ort::SessionOptions sessionOptions;
-        sessionOptions.SetIntraOpNumThreads(1);
+        sessionOptions.SetIntraOpNumThreads(4); // 将线程数由 1 改为 4，大幅提升 CPU 模式下的 FPS
 
         try {
             OrtCUDAProviderOptions cuda_options;
@@ -1044,8 +1044,16 @@ void MainWindow::onDnnResultReceived(const cv::Rect2d &dnnRect, bool success, co
         m_isTargetTracked = true;
         lostFrameCount = 0; // 目标找回，清零
 
-        // 移除平滑滤波，让框框直接等于深度学习的输出，实现“牢牢锁定”而没有延迟跟随
-        m_trackedRect = dnnRect;
+        // 加入平滑滤波 (EMA) 使得框框跟随更加顺滑，消除 YOLO 每帧检测的微小抖动
+        if (m_trackedRect.empty()) {
+            m_trackedRect = dnnRect;
+        } else {
+            double alpha = 0.4; // 平滑系数，0.4 是一个兼顾顺滑和无延迟的好数值
+            m_trackedRect.x = m_trackedRect.x * (1.0 - alpha) + dnnRect.x * alpha;
+            m_trackedRect.y = m_trackedRect.y * (1.0 - alpha) + dnnRect.y * alpha;
+            m_trackedRect.width = m_trackedRect.width * (1.0 - alpha) + dnnRect.width * alpha;
+            m_trackedRect.height = m_trackedRect.height * (1.0 - alpha) + dnnRect.height * alpha;
+        }
 
         int cx = m_frameSize.width() / 2;
         int cy = m_frameSize.height() / 2;

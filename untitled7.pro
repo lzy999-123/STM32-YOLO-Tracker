@@ -32,17 +32,30 @@ OPENCV_DIR = D:/opencv_build/build/install
 # 所以INCLUDEPATH要指向 install/include（opencv2的上级目录）
 INCLUDEPATH += $$OPENCV_DIR/include
 
-# 3. 链接OpenCV库文件（Debug版本，64位）
-LIBS += -L$$OPENCV_DIR/x64/vc17/lib \
-        -lopencv_core4120d \
-        -lopencv_highgui4120d \
-        -lopencv_imgproc4120d \
-        -lopencv_imgcodecs4120d \
-        -lopencv_tracking4120d \ # CSRT追踪核心模块，必须加
-        -lopencv_features2d4120d\
-        -lopencv_calib3d4120d\
-        -lopencv_video4120d\
-        -lopencv_dnn4120d      # 接入DNN
+# 3. 链接OpenCV库文件（自动区分 Debug 和 Release）
+CONFIG(debug, debug|release) {
+    LIBS += -L$$OPENCV_DIR/x64/vc17/lib \
+            -lopencv_core4120d \
+            -lopencv_highgui4120d \
+            -lopencv_imgproc4120d \
+            -lopencv_imgcodecs4120d \
+            -lopencv_tracking4120d \
+            -lopencv_features2d4120d \
+            -lopencv_calib3d4120d \
+            -lopencv_video4120d \
+            -lopencv_dnn4120d
+} else {
+    LIBS += -L$$OPENCV_DIR/x64/vc17/lib \
+            -lopencv_core4120 \
+            -lopencv_highgui4120 \
+            -lopencv_imgproc4120 \
+            -lopencv_imgcodecs4120 \
+            -lopencv_tracking4120 \
+            -lopencv_features2d4120 \
+            -lopencv_calib3d4120 \
+            -lopencv_video4120 \
+            -lopencv_dnn4120
+}
 
 
 # ========== 追加：ONNX Runtime 配置 ==========

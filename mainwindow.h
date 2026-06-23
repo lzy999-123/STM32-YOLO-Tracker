@@ -46,10 +46,12 @@ public:
     void updateDnn(const cv::Mat &frame);
     void stopDnn();
     bool isBusy(); // 判断大脑是否正在忙碌
+    bool isWarmedUp();
     bool isNetEmpty() { return m_ortSession == nullptr; }
 
 signals:
     void dnnTrackedResult(const cv::Rect2d &rect, bool success, const QString &className = "");
+    void dnnWarmupFinished(bool success, const QString &message);
 
 protected:
     void run() override;
@@ -68,11 +70,13 @@ private:
     cv::Rect2d m_lastYoloRect;            // 上一帧的YOLO目标位置
 
     cv::Mat m_frame;
+    cv::Mat m_initFrame;
     cv::Rect2d m_initRect;
     bool m_isTracking;
     bool m_needInit;
     bool m_hasNewFrame;
     bool m_isComputing;
+    bool m_isWarmedUp;
     
     double m_relX;
     double m_relY;
@@ -107,6 +111,7 @@ private slots:
     void onCameraChanged(int index);
     void on_pushButton_9_clicked();
     void handleNewVideoFrame(const QVideoFrame &frame);
+    void processLatestVideoFrame();
     void on_btnSelectTarget_clicked();
     void on_btnStartTracking_clicked();
     void on_btnStopTracking_clicked();
@@ -134,6 +139,9 @@ private:
     QVideoWidget *m_videoWidget;
     QVideoSink *m_videoSink;
     cv::Mat m_lastFrame;
+    QMutex m_pendingFrameMutex;
+    QVideoFrame m_pendingVideoFrame;
+    bool m_frameDispatchPending = false;
 
     bool m_isCapturing;
     bool m_isSelecting;
@@ -171,6 +179,7 @@ private:
     QPixmap m_renderCanvas;
     qint64 m_lastSerialSendTime;
     int m_dnnFrameSkipCounter = 0;
+    int m_lostFrameCount = 0;
 };
 
 #endif // MAINWINDOW_H

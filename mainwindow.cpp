@@ -11,8 +11,13 @@
 #include <QDateTime>
 #include <QPen>
 #include <QRect>
+#include <QCoreApplication>
+#include <QDir>
+#include <QFileInfo>
+#include <QSignalBlocker>
 #include <algorithm>
 #include <cmath>
+#include <stdexcept>
 
 using namespace cv;
 using namespace cv::dnn;
@@ -30,6 +35,7 @@ DnnThread::DnnThread(QObject *parent) : QThread(parent) {
     m_needInit = false;
     m_hasNewFrame = false;
     m_isComputing = false;
+    m_isWarmedUp = false;
     m_useYolo = false;
     m_lockedClassId = -1;
     m_relX = 0; m_relY = 0; m_relW = 1; m_relH = 1;
@@ -49,6 +55,7 @@ DnnThread::DnnThread(QObject *parent) : QThread(parent) {
         m_ortEnv = Ort::Env(ORT_LOGGING_LEVEL_WARNING, "YOLOv8");
         Ort::SessionOptions sessionOptions;
         sessionOptions.SetIntraOpNumThreads(4); // 将线程数由 1 改为 4，大幅提升 CPU 模式下的 FPS
+        sessionOptions.SetGraphOptimizationLevel(GraphOptimizationLevel::ORT_ENABLE_ALL);
 
         try {
             OrtCUDAProviderOptions cuda_options;
@@ -58,8 +65,19 @@ DnnThread::DnnThread(QObject *parent) : QThread(parent) {
         } catch (...) {
             qDebug() << "配置 CUDA 失败，将回退到 CPU!";
         }
-        std::wstring modelPath = L"yolov8n.onnx";
-        m_ortSession = new Ort::Session(m_ortEnv, modelPath.c_str(), sessionOptions);
+        QString modelPath = QDir(QCoreApplication::applicationDirPath()).filePath("yolov8n.onnx");
+        if (!QFileInfo::exists(modelPath)) {
+            const QString developmentPath = QDir::current().filePath("yolov8n.onnx");
+            if (QFileInfo::exists(developmentPath)) {
+                modelPath = developmentPath;
+            }
+        }
+        if (!QFileInfo::exists(modelPath)) {
+            throw std::runtime_error(
+                QString("YOLO model not found: %1").arg(modelPath).toStdString());
+        }
+        m_ortSession = new Ort::Session(
+            m_ortEnv, modelPath.toStdWString().c_str(), sessionOptions);
 
         Ort::AllocatorWithDefaultOptions allocator;
         m_inputNodeNamesStr.clear();
@@ -104,10 +122,15 @@ bool DnnThread::isBusy() {
     return m_isComputing || m_hasNewFrame || m_needInit;
 }
 
+bool DnnThread::isWarmedUp() {
+    QMutexLocker locker(&m_mutex);
+    return m_isWarmedUp;
+}
+
 void DnnThread::initDnn(const cv::Mat &frame, const cv::Rect2d &target) {
     QMutexLocker locker(&m_mutex);
     if(frame.empty()) return;
-    m_frame = frame;
+    m_initFrame = frame;
     m_initRect = target;
     m_needInit = true;
     m_isTracking = true;
@@ -125,6 +148,8 @@ void DnnThread::stopDnn() {
     m_isTracking = false;
     m_needInit = false;
     m_hasNewFrame = false;
+    m_initFrame.release();
+    m_frame.release();
     m_useYolo = false;
     m_lockedClassId = -1;
     m_relX = 0; m_relY = 0; m_relW = 1; m_relH = 1;
@@ -137,6 +162,62 @@ void DnnThread::stopDnn() {
  * 解析后，找到置信度最大且满足 IOU/类别限制的最佳框，通过信号发回主界面。
  */
 void DnnThread::run() {
+    // ONNX Runtime（尤其是 CUDA Provider）的第一次 Run 会创建 CUDA 上下文、
+    // 加载内核并分配显存。提前在后台执行两次空推理，把这笔开销从首次跟踪移走。
+    if (m_ortSession != nullptr && !isInterruptionRequested()) {
+        {
+            QMutexLocker locker(&m_mutex);
+            m_isComputing = true;
+        }
+
+        bool warmupSuccess = false;
+        QString warmupMessage;
+        try {
+            constexpr size_t inputElementCount = 1ULL * 3 * 640 * 640;
+            std::vector<float> warmupInput(inputElementCount, 0.0f);
+            const std::vector<int64_t> inputDims = {1, 3, 640, 640};
+            auto memoryInfo = Ort::MemoryInfo::CreateCpu(
+                OrtDeviceAllocator, OrtMemTypeCPU);
+
+            for (int i = 0; i < 2 && !isInterruptionRequested(); ++i) {
+                Ort::Value inputTensor = Ort::Value::CreateTensor<float>(
+                    memoryInfo,
+                    warmupInput.data(),
+                    warmupInput.size(),
+                    inputDims.data(),
+                    inputDims.size());
+                auto warmupOutputs = m_ortSession->Run(
+                    Ort::RunOptions{nullptr},
+                    m_inputNodeNames.data(),
+                    &inputTensor,
+                    1,
+                    m_outputNodeNames.data(),
+                    1);
+                if (warmupOutputs.empty()) {
+                    throw std::runtime_error("YOLO warmup returned no output");
+                }
+            }
+
+            warmupSuccess = !isInterruptionRequested();
+            warmupMessage = warmupSuccess
+                                ? QStringLiteral("YOLO 推理引擎预热完成")
+                                : QStringLiteral("YOLO 推理引擎预热已取消");
+        } catch (const Ort::Exception &e) {
+            warmupMessage = QStringLiteral("YOLO 预热失败：%1")
+                                .arg(QString::fromUtf8(e.what()));
+        } catch (const std::exception &e) {
+            warmupMessage = QStringLiteral("YOLO 预热失败：%1")
+                                .arg(QString::fromUtf8(e.what()));
+        }
+
+        {
+            QMutexLocker locker(&m_mutex);
+            m_isWarmedUp = warmupSuccess;
+            m_isComputing = false;
+        }
+        emit dnnWarmupFinished(warmupSuccess, warmupMessage);
+    }
+
     while (!isInterruptionRequested()) {
         cv::Mat processFrame;
         bool doInit = false;
@@ -149,7 +230,8 @@ void DnnThread::run() {
                 doInit = true;
                 initR = m_initRect;
                 m_needInit = false;
-                processFrame = m_frame;
+                processFrame = m_initFrame;
+                m_initFrame.release();
                 m_isComputing = true;
             } else if (m_hasNewFrame) {
                 doUpdate = true;
@@ -192,10 +274,29 @@ void DnnThread::run() {
             continue;
         }
 
-        float* output_data = output_tensors[0].GetTensorMutableData<float>();
+        if (output_tensors.empty() || !output_tensors[0].IsTensor()) {
+            qDebug() << "YOLO 输出为空或不是张量";
+            QMutexLocker locker(&m_mutex);
+            m_isComputing = false;
+            m_useYolo = false;
+            continue;
+        }
+
         auto output_info = output_tensors[0].GetTensorTypeAndShapeInfo();
         auto output_dims = output_info.GetShape();
-        
+        if (output_info.GetElementType() != ONNX_TENSOR_ELEMENT_DATA_TYPE_FLOAT ||
+            output_dims.size() != 3 ||
+            output_dims[0] != 1 ||
+            output_dims[1] <= 0 ||
+            output_dims[2] <= 0) {
+            qDebug() << "不支持的 YOLO 输出结构";
+            QMutexLocker locker(&m_mutex);
+            m_isComputing = false;
+            m_useYolo = false;
+            continue;
+        }
+
+        float* output_data = output_tensors[0].GetTensorMutableData<float>();
         int r = output_dims[1]; // 84
         int c = output_dims[2]; // 8400
         cv::Mat output2d(r, c, CV_32F, output_data);
@@ -254,10 +355,15 @@ void DnnThread::run() {
                     h *= 640.0f;
                 }
                 
+                if (!std::isfinite(cx) || !std::isfinite(cy) ||
+                    !std::isfinite(w) || !std::isfinite(h)) {
+                    continue;
+                }
                 int left = int((cx - 0.5 * w) * x_factor);
                 int top = int((cy - 0.5 * h) * y_factor);
                 int width = int(w * x_factor);
                 int height = int(h * y_factor);
+                if (width <= 1 || height <= 1) continue;
 
                 classIds.push_back(best_class_id);
                 confidences.push_back((float)max_class_score);
@@ -305,7 +411,12 @@ void DnnThread::run() {
 
             QMutexLocker locker(&m_mutex);
             // 只要有极其微小的接触(>0.05)，或者距离足够近，就判定为选中该目标
-            if (best_idx != -1) {
+            if (best_idx != -1 &&
+                best_idx < static_cast<int>(classIds.size()) &&
+                classIds[best_idx] >= 0 &&
+                classIds[best_idx] < static_cast<int>(m_classNames.size()) &&
+                boxes[best_idx].width > 0 &&
+                boxes[best_idx].height > 0) {
                 m_lockedClassId = classIds[best_idx];
                 m_useYolo = true;
                 m_lastYoloRect = cv::Rect2d(boxes[best_idx].x, boxes[best_idx].y, boxes[best_idx].width, boxes[best_idx].height);
@@ -370,7 +481,17 @@ void DnnThread::run() {
                         }
                     }
 
-                    if (best_idx != -1) {
+                    const double frameDiagonal = std::hypot(
+                        static_cast<double>(processFrame.cols),
+                        static_cast<double>(processFrame.rows));
+                    const double maxTrackingDistance = std::max(
+                        80.0,
+                        std::min(frameDiagonal * 0.18,
+                                 std::max(lastYoloRect.width, lastYoloRect.height) * 2.5));
+
+                    if (best_idx != -1 && min_dist <= maxTrackingDistance &&
+                        lockedClass >= 0 &&
+                        lockedClass < static_cast<int>(m_classNames.size())) {
                         cv::Rect best_r = boxes[best_idx];
                         cv::Rect2d resRect(best_r.x, best_r.y, best_r.width, best_r.height);
                         {
@@ -425,6 +546,7 @@ MainWindow::MainWindow(QWidget *parent)
     , m_cameraState(CameraState::Idle)
     , m_lastSerialSendTime(0)
     , m_dnnFrameSkipCounter(0)
+    , m_lostFrameCount(0)
 {
     ui->setupUi(this);
     cv::setNumThreads(4); // 限制 CPU 线程数，降低负载和风扇噪音
@@ -451,7 +573,17 @@ MainWindow::MainWindow(QWidget *parent)
     testDNN();
 
     m_dnnThread = new DnnThread(this);
+    ui->btnStartTracking->setEnabled(false);
+    ui->btnStartTracking->setToolTip("YOLO 推理引擎正在后台预热");
     connect(m_dnnThread, &DnnThread::dnnTrackedResult, this, &MainWindow::onDnnResultReceived, Qt::QueuedConnection);
+    connect(m_dnnThread, &DnnThread::dnnWarmupFinished, this,
+            [this](bool success, const QString &message) {
+        ui->btnStartTracking->setEnabled(success);
+        ui->btnStartTracking->setToolTip(
+            success ? QString() : QStringLiteral("YOLO 推理引擎预热失败"));
+        ui->plainTextEdit_2->appendPlainText(
+            QString(success ? "【系统】%1" : "【警告】%1").arg(message));
+    }, Qt::QueuedConnection);
     m_dnnThread->start(QThread::LowPriority);
 
     m_captureSession = new QMediaCaptureSession(this);
@@ -564,6 +696,11 @@ void MainWindow::emergencyCameraStop()
     }
 
     if (m_dnnThread) { m_dnnThread->stopDnn(); }
+    {
+        QMutexLocker locker(&m_pendingFrameMutex);
+        m_pendingVideoFrame = QVideoFrame();
+        m_frameDispatchPending = false;
+    }
 
     {
         QMutexLocker locker(&m_cameraMutex);
@@ -676,7 +813,8 @@ void MainWindow::onCameraChanged(int index)
         m_camera = new QCamera(selectedCamera);
         m_captureSession->setCamera(m_camera);
         m_videoSink = m_captureSession->videoSink();
-        connect(m_videoSink, &QVideoSink::videoFrameChanged, this, &MainWindow::handleNewVideoFrame, Qt::QueuedConnection);
+        connect(m_videoSink, &QVideoSink::videoFrameChanged, this,
+                &MainWindow::handleNewVideoFrame, Qt::DirectConnection);
     } catch (...) { return; }
 
     if(ui->pushButton_9->text() == "关闭摄像头") {
@@ -705,7 +843,12 @@ void MainWindow::on_pushButton_9_clicked()
             }
         }
 
-            if (m_dnnThread) { m_dnnThread->stopDnn(); }
+        if (m_dnnThread) { m_dnnThread->stopDnn(); }
+        {
+            QMutexLocker locker(&m_pendingFrameMutex);
+            m_pendingVideoFrame = QVideoFrame();
+            m_frameDispatchPending = false;
+        }
 
         m_isCapturing = false;
         m_isSelecting = false;
@@ -785,7 +928,8 @@ void MainWindow::on_pushButton_9_clicked()
 
                     if (m_videoSink) { disconnect(m_videoSink, nullptr, this, nullptr); }
                     m_videoSink = m_captureSession->videoSink();
-                    connect(m_videoSink, &QVideoSink::videoFrameChanged, this, &MainWindow::handleNewVideoFrame, Qt::QueuedConnection);
+                    connect(m_videoSink, &QVideoSink::videoFrameChanged, this,
+                            &MainWindow::handleNewVideoFrame, Qt::DirectConnection);
 
                     connect(m_camera, &QCamera::activeChanged, this, [this](bool active) {
                         if (active) {
@@ -797,12 +941,30 @@ void MainWindow::on_pushButton_9_clicked()
                             ui->plainTextEdit_2->appendPlainText("【摄像头】已打开");
                             m_currentCameraId = m_camera->cameraDevice().id();
                             int idx = ui->comboBox_3->findData(m_currentCameraId);
-                            if(idx >= 0) ui->comboBox_3->setCurrentIndex(idx);
+                            if(idx >= 0) {
+                                const QSignalBlocker blocker(ui->comboBox_3);
+                                ui->comboBox_3->setCurrentIndex(idx);
+                            }
                             m_lastFrameTime = 0;
                         }
                     });
+                    connect(m_camera, &QCamera::errorOccurred, this,
+                            [this](QCamera::Error, const QString &errorString) {
+                        if (m_cameraState != CameraState::Opening &&
+                            m_cameraState != CameraState::Open) {
+                            return;
+                        }
+                        ui->plainTextEdit_2->appendPlainText(
+                            QString("【摄像头错误】%1").arg(errorString));
+                        emergencyCameraStop();
+                    });
 
                     m_camera->start();
+                    QTimer::singleShot(5000, this, [this]() {
+                        if (m_cameraState != CameraState::Opening) return;
+                        ui->plainTextEdit_2->appendPlainText("【摄像头错误】启动超时");
+                        emergencyCameraStop();
+                    });
 
                 } catch (...) {
                     QMessageBox::warning(this, "错误", "摄像头打开失败！");
@@ -866,6 +1028,33 @@ QImage MainWindow::CvMatToQImage(const cv::Mat& mat) {
 }
 
 void MainWindow::handleNewVideoFrame(const QVideoFrame &frame) {
+    if (!frame.isValid()) return;
+
+    bool shouldDispatch = false;
+    {
+        QMutexLocker locker(&m_pendingFrameMutex);
+        m_pendingVideoFrame = frame;
+        if (!m_frameDispatchPending) {
+            m_frameDispatchPending = true;
+            shouldDispatch = true;
+        }
+    }
+
+    if (shouldDispatch) {
+        QMetaObject::invokeMethod(
+            this, &MainWindow::processLatestVideoFrame, Qt::QueuedConnection);
+    }
+}
+
+void MainWindow::processLatestVideoFrame() {
+    QVideoFrame frame;
+    {
+        QMutexLocker locker(&m_pendingFrameMutex);
+        frame = m_pendingVideoFrame;
+        m_pendingVideoFrame = QVideoFrame();
+        m_frameDispatchPending = false;
+    }
+
     if (m_cameraState != CameraState::Open) return;
     bool cameraOk = false;
     { QMutexLocker locker(&m_cameraMutex); cameraOk = m_camera && m_camera->isActive() && m_cameraState == CameraState::Open; }
@@ -874,11 +1063,29 @@ void MainWindow::handleNewVideoFrame(const QVideoFrame &frame) {
     try { cvMat = QVideoFrameToCvMat(frame); } catch (...) { return; }
     if (cvMat.empty()) return;
     cv::flip(cvMat, cvMat, -1);
-    { QMutexLocker locker(&m_cameraMutex); if (m_cameraState != CameraState::Open) return; m_lastFrame = cvMat.clone(); }
     { QMutexLocker locker(&m_frameSizeMutex); m_frameSize = QSize(cvMat.cols, cvMat.rows); }
-    if (m_isCapturing && m_dnnThread && !m_dnnThread->isInterruptionRequested()) {
-        if (!m_dnnThread->isBusy()) { m_dnnThread->updateDnn(cvMat); }
+    if (m_forceResetTracking) {
+        if (m_wasTrackingBeforeDisconn && m_hasSelectedTarget &&
+            m_dnnThread && !m_dnnThread->isNetEmpty()) {
+            const cv::Rect2d frameBounds(0, 0, cvMat.cols, cvMat.rows);
+            m_selectedRect = m_lastSelectedRect & frameBounds;
+            if (m_selectedRect.width >= 8 && m_selectedRect.height >= 8) {
+                m_trackedRect = cv::Rect2d();
+                m_lostFrameCount = 0;
+                m_isCapturing = true;
+                m_dnnThread->initDnn(cvMat, m_selectedRect);
+                ui->plainTextEdit_2->appendPlainText("【系统】摄像头已恢复，正在重新锁定目标");
+            }
+        }
+        m_forceResetTracking = false;
+        m_wasTrackingBeforeDisconn = false;
     }
+    if (m_isCapturing && m_dnnThread && !m_dnnThread->isInterruptionRequested()) {
+        // 推理忙碌时不排队旧帧，而是持续覆盖为摄像头的最新源帧。
+        // 当前推理结束后会直接处理此刻最新的画面。
+        m_dnnThread->updateDnn(cvMat);
+    }
+    { QMutexLocker locker(&m_cameraMutex); if (m_cameraState != CameraState::Open) return; m_lastFrame = cvMat.clone(); }
     // ==== 纯 YOLOv8 UI 渲染与控制逻辑 ====
     // 此段代码负责将 OpenCV 处理出的画面转换为 Qt 的 QImage，
     // 并将底层计算出的 YOLOv8 跟踪框(m_trackedRect)映射到 UI 界面的正确比例和位置进行绘制。
@@ -1038,21 +1245,39 @@ void MainWindow::onDnnResultReceived(const cv::Rect2d &dnnRect, bool success, co
     const int DEAD_ZONE = 18;
     bool currentSuccess = (success && isReasonable);
 
-    static int lostFrameCount = 0;
-
     if (currentSuccess) {
         m_isTargetTracked = true;
-        lostFrameCount = 0; // 目标找回，清零
+        m_lostFrameCount = 0; // 目标找回，清零
 
-        // 加入平滑滤波 (EMA) 使得框框跟随更加顺滑，消除 YOLO 每帧检测的微小抖动
+        // 自适应滤波：静止时抑制检测抖动，快速移动时立即跟随，
+        // 避免固定低 alpha 造成明显拖尾。
         if (m_trackedRect.empty()) {
             m_trackedRect = dnnRect;
         } else {
-            double alpha = 0.4; // 平滑系数，0.4 是一个兼顾顺滑和无延迟的好数值
-            m_trackedRect.x = m_trackedRect.x * (1.0 - alpha) + dnnRect.x * alpha;
-            m_trackedRect.y = m_trackedRect.y * (1.0 - alpha) + dnnRect.y * alpha;
-            m_trackedRect.width = m_trackedRect.width * (1.0 - alpha) + dnnRect.width * alpha;
-            m_trackedRect.height = m_trackedRect.height * (1.0 - alpha) + dnnRect.height * alpha;
+            const double oldCenterX = m_trackedRect.x + m_trackedRect.width * 0.5;
+            const double oldCenterY = m_trackedRect.y + m_trackedRect.height * 0.5;
+            const double newCenterX = dnnRect.x + dnnRect.width * 0.5;
+            const double newCenterY = dnnRect.y + dnnRect.height * 0.5;
+            const double movement = std::hypot(
+                newCenterX - oldCenterX, newCenterY - oldCenterY);
+            const double targetScale = std::max(
+                20.0, std::max(dnnRect.width, dnnRect.height));
+            const double movementRatio = movement / targetScale;
+
+            double positionAlpha = 0.45;
+            if (movementRatio > 0.18) {
+                positionAlpha = 1.0;
+            } else if (movementRatio > 0.08) {
+                positionAlpha = 0.82;
+            } else if (movementRatio > 0.03) {
+                positionAlpha = 0.65;
+            }
+            const double sizeAlpha = std::min(0.75, positionAlpha);
+
+            m_trackedRect.x += (dnnRect.x - m_trackedRect.x) * positionAlpha;
+            m_trackedRect.y += (dnnRect.y - m_trackedRect.y) * positionAlpha;
+            m_trackedRect.width += (dnnRect.width - m_trackedRect.width) * sizeAlpha;
+            m_trackedRect.height += (dnnRect.height - m_trackedRect.height) * sizeAlpha;
         }
 
         int cx = m_frameSize.width() / 2;
@@ -1069,16 +1294,16 @@ void MainWindow::onDnnResultReceived(const cv::Rect2d &dnnRect, bool success, co
         m_offsetX = offset_x;
         m_offsetY = offset_y;
     } else {
-        lostFrameCount++;
+        m_lostFrameCount++;
         const int MAX_LOST_TOLERANCE = 15; // 容忍15帧（约0.5秒）的识别丢失
 
-        if (lostFrameCount > MAX_LOST_TOLERANCE) {
+        if (m_lostFrameCount > MAX_LOST_TOLERANCE) {
             m_isTargetTracked = false;
             m_offsetX = 0;
             m_offsetY = 0;
 
             // 彻底丢失时的响应：清除框，并输出日志提醒
-            if (lostFrameCount == MAX_LOST_TOLERANCE + 1) {
+            if (m_lostFrameCount == MAX_LOST_TOLERANCE + 1) {
                 if (ui->plainTextEdit_2) {
                     ui->plainTextEdit_2->appendPlainText("【警告】目标丢失！已清除追踪框，正在尝试找回...");
                 }
@@ -1096,6 +1321,7 @@ void MainWindow::on_btnSelectTarget_clicked() {
     if (!m_camera || !m_camera->isActive()) { QMessageBox::warning(this, "提示", "请先打开摄像头！"); return; }
     if (m_dnnThread) { m_dnnThread->stopDnn(); }
     m_hasSelectedTarget = false; m_trackedRect = cv::Rect2d(); m_isTargetTracked = false; m_isSelecting = true;
+    m_lostFrameCount = 0;
     m_selectStart = QPoint(); m_selectEnd = QPoint(); m_selectStartImg = QPoint(); m_selectEndImg = QPoint();
     ui->plainTextEdit_2->appendPlainText("【提示】正在框选，请在画面内拖动鼠标...");
 }
@@ -1103,15 +1329,27 @@ void MainWindow::on_btnSelectTarget_clicked() {
 void MainWindow::on_btnStartTracking_clicked() {
     if (!m_camera || !m_camera->isActive()) { QMessageBox::warning(this, "提示", "请先打开摄像头！"); return; }
     if (!m_hasSelectedTarget) { QMessageBox::warning(this, "提示", "请先选择目标！"); return; }
-    m_isCapturing = true; m_wasTrackingBeforeDisconn = true;
-    if (m_dnnThread) {
-        if (m_dnnThread->isNetEmpty()) { ui->plainTextEdit_2->appendPlainText("❌【错误】YOLO 模型加载失败，请检查 yolov8n.onnx 是否在 exe 同级目录下！"); }
-        else {
-            cv::Mat currentFrameClone;
-            { QMutexLocker locker(&m_cameraMutex); if (!m_lastFrame.empty()) currentFrameClone = m_lastFrame.clone(); }
-            if (!currentFrameClone.empty()) m_dnnThread->initDnn(currentFrameClone, m_selectedRect);
-        }
+    if (!m_dnnThread || m_dnnThread->isNetEmpty()) {
+        ui->plainTextEdit_2->appendPlainText(
+            "❌【错误】YOLO 模型加载失败，请检查程序目录或当前工作目录中的 yolov8n.onnx！");
+        return;
     }
+    if (!m_dnnThread->isWarmedUp()) {
+        ui->plainTextEdit_2->appendPlainText("【提示】YOLO 引擎正在后台预热，请稍候再开始跟踪。");
+        return;
+    }
+
+    cv::Mat currentFrameClone;
+    { QMutexLocker locker(&m_cameraMutex); if (!m_lastFrame.empty()) currentFrameClone = m_lastFrame.clone(); }
+    if (currentFrameClone.empty()) {
+        ui->plainTextEdit_2->appendPlainText("【提示】尚未收到摄像头画面，请稍后重试。");
+        return;
+    }
+
+    m_isCapturing = true;
+    m_wasTrackingBeforeDisconn = true;
+    m_lostFrameCount = 0;
+    m_dnnThread->initDnn(currentFrameClone, m_selectedRect);
     if(ui->label_11->text()=="自动") sendCommand(0x11);
     ui->plainTextEdit_2->appendPlainText("开始纯 YOLOv8 跟踪！");
 }
@@ -1120,6 +1358,7 @@ void MainWindow::on_btnStopTracking_clicked() {
     if (!m_camera || !m_camera->isActive()) { return; }
     if (!m_hasSelectedTarget) { return; }
     m_isCapturing = false;
+    m_lostFrameCount = 0;
     if (m_dnnThread) m_dnnThread->stopDnn();
     m_trackedRect = cv::Rect2d(); m_wasTrackingBeforeDisconn = false; m_isTargetTracked = false; m_offsetX = 0; m_offsetY = 0;
     if(ui->label_11->text()=="自动") sendCommand(0x12);
@@ -1139,6 +1378,8 @@ void MainWindow::mousePressEvent(QMouseEvent *event) {
     QSize scaledImageSize = imageSize.scaled(labelSize, Qt::KeepAspectRatio);
     int xOffset = (labelSize.width() - scaledImageSize.width()) / 2;
     int yOffset = (labelSize.height() - scaledImageSize.height()) / 2;
+    QRect displayedImageRect(QPoint(xOffset, yOffset), scaledImageSize);
+    if (!displayedImageRect.contains(localPos)) return;
     double scaleX = (double)imageSize.width() / scaledImageSize.width();
     double scaleY = (double)imageSize.height() / scaledImageSize.height();
     m_selectStartImg = QPoint((int)((localPos.x() - xOffset) * scaleX), (int)((localPos.y() - yOffset) * scaleY));
@@ -1157,6 +1398,9 @@ void MainWindow::mouseMoveEvent(QMouseEvent *event) {
     QSize scaledImageSize = imageSize.scaled(labelSize, Qt::KeepAspectRatio);
     int xOffset = (labelSize.width() - scaledImageSize.width()) / 2;
     int yOffset = (labelSize.height() - scaledImageSize.height()) / 2;
+    QRect displayedImageRect(QPoint(xOffset, yOffset), scaledImageSize);
+    localPos.setX(std::clamp(localPos.x(), displayedImageRect.left(), displayedImageRect.right()));
+    localPos.setY(std::clamp(localPos.y(), displayedImageRect.top(), displayedImageRect.bottom()));
     double scaleX = (double)imageSize.width() / scaledImageSize.width();
     double scaleY = (double)imageSize.height() / scaledImageSize.height();
     m_selectEndImg = QPoint((int)((localPos.x() - xOffset) * scaleX), (int)((localPos.y() - yOffset) * scaleY));
@@ -1174,12 +1418,16 @@ void MainWindow::mouseReleaseEvent(QMouseEvent *event) {
     QSize scaledImageSize = imageSize.scaled(labelSize, Qt::KeepAspectRatio);
     int xOffset = (labelSize.width() - scaledImageSize.width()) / 2;
     int yOffset = (labelSize.height() - scaledImageSize.height()) / 2;
+    QRect displayedImageRect(QPoint(xOffset, yOffset), scaledImageSize);
+    localPos.setX(std::clamp(localPos.x(), displayedImageRect.left(), displayedImageRect.right()));
+    localPos.setY(std::clamp(localPos.y(), displayedImageRect.top(), displayedImageRect.bottom()));
     double scaleX = (double)imageSize.width() / scaledImageSize.width();
     double scaleY = (double)imageSize.height() / scaledImageSize.height();
     m_selectEndImg = QPoint((int)((localPos.x() - xOffset) * scaleX), (int)((localPos.y() - yOffset) * scaleY));
     m_isSelecting = false;
 
-    QRect selectRect = QRect(m_selectStartImg, m_selectEndImg).normalized();
+    QRect selectRect = QRect(m_selectStartImg, m_selectEndImg).normalized()
+                           .intersected(QRect(0, 0, frameSize.width(), frameSize.height()));
     if (selectRect.width() < 8 || selectRect.height() < 8) {
         QMessageBox::warning(this, "提示", "框选区域太小！");
         return;
@@ -1250,8 +1498,20 @@ void MainWindow::messlot() {
     m_rx_buffer.append(new_data);
 
     while (true) {
-        int head = m_rx_buffer.indexOf("AA"); int tail = m_rx_buffer.indexOf("BB");
-        if (head == -1 || tail == -1 || tail <= head) break;
+        int head = m_rx_buffer.indexOf("AA");
+        if (head == -1) {
+            if (m_rx_buffer.size() > 1) m_rx_buffer = m_rx_buffer.right(1);
+            break;
+        }
+        if (head > 0) {
+            m_rx_buffer.remove(0, head);
+            head = 0;
+        }
+        int tail = m_rx_buffer.indexOf("BB", head + 2);
+        if (tail == -1) {
+            if (m_rx_buffer.size() > 4096) m_rx_buffer.truncate(4096);
+            break;
+        }
         QByteArray frame = m_rx_buffer.mid(head, tail - head + 2);
         QString s = QString::fromUtf8(frame); QStringList list = s.mid(2, s.length() - 4).split(",");
         if (list.count() == 3) {

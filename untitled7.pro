@@ -25,7 +25,8 @@ else: unix:!android: target.path = /opt/$${TARGET}/bin
 
 # ========== 追加：OpenCV 配置（核心，需修改以下 3 处关键内容）==========
 # 1. 编译后的OpenCV安装路径（关键：是build/install，不是原始opencv文件夹）
-OPENCV_DIR = D:/opencv_build/build/install
+OPENCV_DIR = $$(OPENCV_DIR)
+isEmpty(OPENCV_DIR): OPENCV_DIR = D:/opencv_build/build/install
 
 # 2. 头文件路径：指向包含opencv2文件夹的上级目录（关键修改！）
 # 你的正确路径是：install/include/opencv2/opencv.hpp
@@ -59,7 +60,8 @@ CONFIG(debug, debug|release) {
 
 
 # ========== 追加：ONNX Runtime 配置 ==========
-ONNXRUNTIME_DIR = D:/onnxruntime_gpu/onnxruntime-win-x64-gpu-1.20.1
+ONNXRUNTIME_DIR = $$(ONNXRUNTIME_DIR)
+isEmpty(ONNXRUNTIME_DIR): ONNXRUNTIME_DIR = D:/onnxruntime_gpu/onnxruntime-win-x64-gpu-1.20.1
 
 INCLUDEPATH += $$ONNXRUNTIME_DIR/include
 LIBS += -L$$ONNXRUNTIME_DIR/lib -lonnxruntime -lonnxruntime_providers_cuda -lonnxruntime_providers_shared

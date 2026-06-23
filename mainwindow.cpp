@@ -1052,7 +1052,8 @@ void MainWindow::processLatestVideoFrame() {
         QMutexLocker locker(&m_pendingFrameMutex);
         frame = m_pendingVideoFrame;
         m_pendingVideoFrame = QVideoFrame();
-        m_frameDispatchPending = false;
+        // m_frameDispatchPending is intentionally NOT set to false here,
+        // it will be reset at the end of the function to prevent UI thread starvation.
     }
 
     if (m_cameraState != CameraState::Open) return;
@@ -1198,6 +1199,11 @@ void MainWindow::processLatestVideoFrame() {
         } else {
             if (!m_waitingForRecover) ui->plainTextEdit->setPlainText("未追踪到目标\n舵机保持居中");
         }
+    }
+    
+    {
+        QMutexLocker locker(&m_pendingFrameMutex);
+        m_frameDispatchPending = false;
     }
 }
 

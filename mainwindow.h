@@ -50,7 +50,8 @@ public:
     bool isNetEmpty() { return m_ortSession == nullptr; }
 
 signals:
-    void dnnTrackedResult(const cv::Rect2d &rect, bool success, const QString &className = "");
+    void dnnTrackedResult(const cv::Rect2d &rect, bool success,
+                          const QString &className, const QImage &sourceImage);
     void dnnWarmupFinished(bool success, const QString &message);
 
 protected:
@@ -117,7 +118,8 @@ private slots:
     void on_btnStopTracking_clicked();
     void on_pushButton_2_clicked();
     void on_pushButton_3_clicked();
-    void onDnnResultReceived(const cv::Rect2d &dnnRect, bool success, const QString &className = "");
+    void onDnnResultReceived(const cv::Rect2d &dnnRect, bool success,
+                             const QString &className, const QImage &sourceImage);
 
 protected:
     void closeEvent(QCloseEvent *event) override;
@@ -129,6 +131,7 @@ protected:
 private:
     void testDNN();
     void sendCommand(uint8_t cmd);
+    void renderVideoImage(const QImage &img, const cv::Rect2d &renderRect);
 
     Ui::MainWindow *ui;
     QSerialPort m_serial;
@@ -152,6 +155,7 @@ private:
     QPoint m_selectEndImg;
     cv::Rect2d m_selectedRect;
     cv::Rect2d m_trackedRect;
+    cv::Rect2d m_displayTrackedRect;
 
     DnnThread *m_dnnThread;
 
@@ -177,6 +181,7 @@ private:
 
     CameraState m_cameraState = CameraState::Idle;
     QPixmap m_renderCanvas;
+    QImage m_trackingDisplayImage;
     qint64 m_lastSerialSendTime;
     int m_dnnFrameSkipCounter = 0;
     int m_lostFrameCount = 0;

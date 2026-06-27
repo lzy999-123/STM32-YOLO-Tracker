@@ -35,95 +35,123 @@ namespace Ui { class MainWindow; }
 QT_END_NAMESPACE
 
 
-// ==========================================
-// 大脑：DNN 深度学习纠错线程
-// ==========================================
-
-
-
-
-// ==========================================
-// 主窗口类
-// ==========================================
+/**
+ * @brief Qt 桌面主窗口类
+ * 负责整个程序的界面呈现、用户交互（如鼠标框选）、各子模块（相机、串口、引擎）的管理调度，
+ * 并负责汇总数据进行界面 UI 的实时重绘。
+ */
 class MainWindow : public QMainWindow
 {
     Q_OBJECT
 
 public:
+    /// @brief 追踪后端枚举：YOLO 或 传统特征点混合
     enum class TrackingBackend { Yolo, Feature };
 
     MainWindow(QWidget *parent = nullptr);
     ~MainWindow();
 
+    /**
+     * @brief 图像格式转换工具：QImage 转 OpenCV cv::Mat
+     */
     static cv::Mat QImageToCvMat(const QImage& qImage);
+    
+    /**
+     * @brief 图像格式转换工具：QVideoFrame 转 OpenCV cv::Mat
+     */
     cv::Mat QVideoFrameToCvMat(const QVideoFrame &frame);
+    
+    /**
+     * @brief 图像格式转换工具：OpenCV cv::Mat 转 QImage
+     */
     static QImage CvMatToQImage(const cv::Mat& mat);
 
 private slots:
-    void on_pushButton_clicked();
-    void on_pushButton_8_clicked();
-    void onCameraChanged(int index);
-    void on_pushButton_9_clicked();
+    // UI 按钮与控件事件的槽函数
+    void on_pushButton_clicked();               ///< 可能是连接/断开串口等按钮
+    void on_pushButton_8_clicked();             ///< 某控制按钮
+    void onCameraChanged(int index);            ///< 用户切换摄像头下拉框
+    void on_pushButton_9_clicked();             ///< 开启/关闭摄像头等按钮
+    
+    /// @brief 接收底层摄像头传来的最新视频帧
     void handleNewVideoFrame(const QVideoFrame &frame);
+    
+    /// @brief 对接收的视频帧进行真正的显示与逻辑处理
     void processLatestVideoFrame();
-    void on_btnSelectTarget_clicked();
-    void on_btnStartTracking_clicked();
-    void on_btnStopTracking_clicked();
-    void on_pushButton_2_clicked();
-    void on_pushButton_3_clicked();
-    void onTrackingModelChanged(int index);
+    
+    void on_btnSelectTarget_clicked();          ///< 点击“选择目标”按钮
+    void on_btnStartTracking_clicked();         ///< 点击“开始追踪”按钮
+    void on_btnStopTracking_clicked();          ///< 点击“停止追踪”按钮
+    void on_pushButton_2_clicked();             ///< 串口云台测试/移动控制指令
+    void on_pushButton_3_clicked();             ///< 串口云台测试/移动控制指令
+    void onTrackingModelChanged(int index);     ///< 用户切换 YOLO 模型下拉框
 
 protected:
+    /// @brief 拦截窗口关闭事件，确保各线程和底层硬件资源安全释放
     void closeEvent(QCloseEvent *event) override;
+    
+    // 以下为重写的鼠标与绘制事件，实现画框交互与结果展示
     void mousePressEvent(QMouseEvent *event) override;
     void mouseMoveEvent(QMouseEvent *event) override;
     void mouseReleaseEvent(QMouseEvent *event) override;
     void paintEvent(QPaintEvent *event) override;
 
 private:
+    /// @brief 测试 DNN 环境可用性的内部方法
     void testDNN();
+    
+    /// @brief 向串口发送命令字的内部包装方法
     void sendCommand(uint8_t cmd);
+    
+    /// @brief 获取 UI 上当前选中的模型文件名
     QString currentTrackingModelFileName() const;
+    
+    /// @brief 获取 UI 上当前选用的追踪后端类型
     TrackingBackend currentTrackingBackend() const;
+    
+    /// @brief 判断当前是否选中了特征追踪模式
     bool isFeatureTrackingSelected() const;
 
-    Ui::MainWindow *ui;
-    SerialController m_serialController;
-    CameraManager m_cameraManager;
-    TrackingEngine m_trackingEngine;
-    cv::Mat m_lastFrame;
-    QMutex m_pendingFrameMutex;
-    QVideoFrame m_pendingVideoFrame;
-    bool m_frameDispatchPending = false;
+    Ui::MainWindow *ui;                      ///< UI 界面对象
+    SerialController m_serialController;     ///< 串口控制器模块
+    CameraManager m_cameraManager;           ///< 摄像头管理器模块
+    TrackingEngine m_trackingEngine;         ///< 目标追踪引擎核心模块
+    
+    cv::Mat m_lastFrame;                     ///< 转换后的 OpenCV 图像缓存
+    QMutex m_pendingFrameMutex;              ///< 线程安全保护锁
+    QVideoFrame m_pendingVideoFrame;         ///< 缓存未处理的最新的视频帧
+    bool m_frameDispatchPending = false;     ///< 是否有待调度的视频帧
 
-    bool m_isCapturing;
-    bool m_isSelecting;
-    bool m_hasSelectedTarget;
+    bool m_isCapturing;                      ///< 摄像头是否正在取景中
+    bool m_isSelecting;                      ///< 用户是否正在用鼠标画框
+    bool m_hasSelectedTarget;                ///< 是否已经成功选定了追踪区域
+    
+    // 鼠标选取在 UI 和原图上的坐标记录
     QPoint m_selectStart;
     QPoint m_selectEnd;
     QPoint m_selectStartImg;
     QPoint m_selectEndImg;
-    cv::Rect2d m_selectedRect;
-    cv::Rect2d m_trackedRect;
+    cv::Rect2d m_selectedRect;               ///< 用户画好的选区
+    cv::Rect2d m_trackedRect;                ///< 引擎返回的当前追踪框
 
     QMutex m_modeMutex;
-    int m_currentMode;
+    int m_currentMode;                       ///< 系统的当前运行模式
 
     QMutex m_frameSizeMutex;
-    QSize m_frameSize;
-    bool m_isTargetTracked;
+    QSize m_frameSize;                       ///< 当前画面分辨率
+    bool m_isTargetTracked;                  ///< 当前是否锁定到目标
 
-    int16_t m_offsetX;
-    int16_t m_offsetY;
-    cv::Rect2d m_lastSelectedRect;
-    bool m_wasTrackingBeforeDisconn;
+    int16_t m_offsetX;                       ///< UI 计算的云台相对中心点X轴偏移
+    int16_t m_offsetY;                       ///< UI 计算的云台相对中心点Y轴偏移
+    cv::Rect2d m_lastSelectedRect;           ///< 上次框选记录
+    bool m_wasTrackingBeforeDisconn;         ///< 断开连接前是否处于追踪状态
 
-    bool m_forceResetTracking;
-    bool m_waitingForRecover;
-    QPixmap m_renderCanvas;
-    qint64 m_lastSerialSendTime;
-    int m_dnnFrameSkipCounter = 0;
-    int m_lostFrameCount = 0;
+    bool m_forceResetTracking;               ///< 是否强制重置追踪状态
+    bool m_waitingForRecover;                ///< 是否正处于丢失后等待恢复阶段
+    QPixmap m_renderCanvas;                  ///< 界面重绘用的像素画布缓存
+    qint64 m_lastSerialSendTime;             ///< 上次通过串口发送数据的毫秒时间戳
+    int m_dnnFrameSkipCounter = 0;           ///< 跳帧计数器（降低刷新率）
+    int m_lostFrameCount = 0;                ///< 丢失目标的持续帧数
 };
 
 #endif // MAINWINDOW_H

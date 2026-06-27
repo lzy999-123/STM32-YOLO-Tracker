@@ -20,6 +20,8 @@ qrc_*.cpp
 *.dll
 *.exe
 *.onnx
+*.pt
+runs/
 
 # IDEs
 .vscode/

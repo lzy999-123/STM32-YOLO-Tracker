@@ -25,7 +25,7 @@ using namespace cv;
 using namespace cv::dnn;
 
 // ==========================================
-// 大脑线程实现 (YOLOv8)
+// 大脑线程实现 (YOLO26)
 // ==========================================
 DnnThread::DnnThread(QObject *parent) : QThread(parent) {
     m_isTracking = false;
@@ -47,9 +47,9 @@ DnnThread::DnnThread(QObject *parent) : QThread(parent) {
     };
 
     try {
-        m_yoloNet = cv::dnn::readNetFromONNX(yolov8n.onnx);
+        m_yoloNet = cv::dnn::readNetFromONNX(yolo26n.onnx);
         if (m_yoloNet.empty()) {
-            qDebug() << YOLO 模型加载失败: yolov8n.onnx 为空;
+            qDebug() << YOLO 模型加载失败: yolo26n.onnx 为空;
         } else {
             m_yoloNet.setPreferableBackend(cv::dnn::DNN_BACKEND_OPENCV);
             m_yoloNet.setPreferableTarget(cv::dnn::DNN_TARGET_OPENCL); // 尝试使用集成显卡(OpenCL)加速

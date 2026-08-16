@@ -252,7 +252,6 @@ void TrackingEngine::onYoloDetectionResult(
     quint64 requestId,
     bool finished)
 {
-    static qint64 lastYoloRecoveryLogTime = 0;
     if (m_featureYoloClassifyPending &&
         requestId == m_featureYoloClassifyRequestId &&
         !m_featureYoloClassifyFrame.empty()) {
@@ -410,8 +409,8 @@ void TrackingEngine::onYoloDetectionResult(
     if (m_featureYoloBestCandidate.width <= 0 ||
         m_featureYoloBestCandidate.height <= 0) {
         const qint64 now = QDateTime::currentMSecsSinceEpoch();
-        if (now - lastYoloRecoveryLogTime > 1200) {
-            lastYoloRecoveryLogTime = now;
+        if (now - m_lastFeatureYoloRecoveryLogTime > 1200) {
+            m_lastFeatureYoloRecoveryLogTime = now;
             emit logMessage(
                 QStringLiteral("【系统】YOLO 已检测到候选，但与初始目标外观不够一致，继续等待。"));
         }
@@ -428,8 +427,8 @@ void TrackingEngine::onYoloDetectionResult(
             methodName,
             m_featureYoloBestScore)) {
         const qint64 now = QDateTime::currentMSecsSinceEpoch();
-        if (now - lastYoloRecoveryLogTime > 1200) {
-            lastYoloRecoveryLogTime = now;
+        if (now - m_lastFeatureYoloRecoveryLogTime > 1200) {
+            m_lastFeatureYoloRecoveryLogTime = now;
             emit logMessage(
                 QStringLiteral("【系统】YOLO 候选已通过外观校验，正在连续确认..."));
         }
@@ -473,16 +472,16 @@ void TrackingEngine::restartDnnThread(const QString &modelFileName)
 
 void TrackingEngine::preloadYoloModels()
 {
-    ensureDnnThread(QStringLiteral("yolov8s.onnx"));
-    ensureDnnThread(QStringLiteral("yolov8n.onnx"));
+    ensureDnnThread(QStringLiteral("yolo26s.onnx"));
+    ensureDnnThread(QStringLiteral("yolo26n.onnx"));
     emit logMessage(
-        QStringLiteral("【系统】已启动 YOLOv8s 与 YOLOv8n 后台预热。"));
+        QStringLiteral("【系统】已启动 YOLO26s 与 YOLO26n 后台预热。"));
 }
 
 DnnThread *TrackingEngine::ensureDnnThread(const QString &modelFileName)
 {
     const QString key = modelFileName.isEmpty()
-                            ? QStringLiteral("yolov8s.onnx")
+                            ? QStringLiteral("yolo26s.onnx")
                             : modelFileName;
     if (DnnThread *existingThread = m_dnnThreads.value(key, nullptr)) {
         return existingThread;

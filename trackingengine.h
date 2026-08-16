@@ -269,6 +269,7 @@ private:
     double m_featureYoloRelH = 0.0;
     qint64 m_lastFeatureRecoveryStrategyLogTime = 0;
     QString m_lastFeatureRecoveryStrategyLog;
+    qint64 m_lastFeatureYoloRecoveryLogTime = 0;
 
     // 常量定义，包含各项相似度与阈值的参数设置
     static constexpr double kFeatureMinSimilarityScore = 0.5;

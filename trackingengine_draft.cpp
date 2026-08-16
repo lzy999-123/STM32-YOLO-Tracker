@@ -335,10 +335,10 @@ void TrackingEngine::restartDnnThread(const QString &modelFileName)
 
 void TrackingEngine::preloadYoloModels()
 {
-    ensureDnnThread(QStringLiteral("yolov8s.onnx"));
-    ensureDnnThread(QStringLiteral("yolov8n.onnx"));
+    ensureDnnThread(QStringLiteral("yolo26s.onnx"));
+    ensureDnnThread(QStringLiteral("yolo26n.onnx"));
     emit logMessage(
-        QStringLiteral("【系统】已启动 YOLOv8s 与 YOLOv8n 后台预热。"));
+        QStringLiteral("【系统】已启动 YOLO26s 与 YOLO26n 后台预热。"));
 }
 
 void TrackingEngine::resetFeatureTracker()

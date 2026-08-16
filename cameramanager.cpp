@@ -41,15 +41,17 @@ void CameraManager::startChecking()
 
 void CameraManager::safeDeleteCamera()
 {
-    QMutexLocker locker(&m_cameraMutex); // 加锁防止多线程竞态
-    if (m_camera) {
-        // 断开信号，停止视频流，解除绑定并删除相机对象
-        disconnect(m_camera, &QCamera::activeChanged, this, nullptr);
-        disconnect(m_camera, &QCamera::errorOccurred, this, nullptr);
-        m_camera->stop();
+    QCamera *camera = nullptr;
+    {
+        QMutexLocker locker(&m_cameraMutex);
+        camera = std::exchange(m_camera, nullptr);
+    }
+    if (camera) {
+        // 先摘除成员指针和信号，再停止设备，避免停止过程中重入清理逻辑。
+        disconnect(camera, nullptr, this, nullptr);
         m_captureSession->setCamera(nullptr);
-        m_camera->deleteLater();
-        m_camera = nullptr;
+        camera->stop();
+        camera->deleteLater();
     }
 }
 
@@ -69,29 +71,28 @@ void CameraManager::openCamera(const QString &cameraId)
         
         // 遍历比对，找到用户选中的那一个设备
         for (const QCameraDevice &device : std::as_const(cameras)) {
-            if (device.id() == cameraId) {
+            if (device.id() == cameraId.toUtf8()) {
                 selectedCamera = device;
                 break;
             }
         }
         
         if (!selectedCamera.isNull()) {
-            QMutexLocker locker(&m_cameraMutex);
-            if (m_camera) {
-                // 如果已有老相机在运行，先释放
-                m_camera->stop();
-                m_camera->deleteLater();
+            safeDeleteCamera();
+            QCamera *camera = new QCamera(selectedCamera, this);
+            {
+                QMutexLocker locker(&m_cameraMutex);
+                m_camera = camera;
             }
             // 实例化新的相机并绑定到捕获会话
-            m_camera = new QCamera(selectedCamera);
-            m_captureSession->setCamera(m_camera);
+            m_captureSession->setCamera(camera);
             
             // 连接状态和错误回调
-            connect(m_camera, &QCamera::activeChanged, this, &CameraManager::onCameraActiveChanged);
-            connect(m_camera, &QCamera::errorOccurred, this, &CameraManager::onCameraErrorOccurred);
+            connect(camera, &QCamera::activeChanged, this, &CameraManager::onCameraActiveChanged);
+            connect(camera, &QCamera::errorOccurred, this, &CameraManager::onCameraErrorOccurred);
             
             m_lastFrameTime = QDateTime::currentMSecsSinceEpoch();
-            m_camera->start(); // 正式启动画面采集
+            camera->start(); // 正式启动画面采集
         } else {
             // 没有找到匹配的设备
             m_cameraState = CameraState::Idle;

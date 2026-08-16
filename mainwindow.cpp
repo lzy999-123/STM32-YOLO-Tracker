@@ -3,6 +3,7 @@
 
 #include <QCameraDevice>
 #include <QDateTime>
+#include <QMediaDevices>
 #include <QMessageBox>
 #include <QPainter>
 #include <QPen>
@@ -74,9 +75,46 @@ MainWindow::MainWindow(QWidget *parent)
         }
     });
 
+    // 串口链路状态信号（协议 v2）：断线/重连/下位机在线/命令失败
+    connect(&m_serialController, &SerialController::connectionLost, this,
+            [this](const QString &reason) {
+        ui->plainTextEdit_2->appendPlainText(
+            QStringLiteral("【串口】连接丢失：%1，自动重连中...").arg(reason));
+        ui->LED1->setStyleSheet(QStringLiteral("background-color:yellow"));
+        ui->lineEdit->setText(QStringLiteral("重连中..."));
+        ui->pushButton_2->setEnabled(false);
+        ui->pushButton_3->setEnabled(false);
+    });
+    connect(&m_serialController, &SerialController::reconnected, this, [this]() {
+        ui->plainTextEdit_2->appendPlainText(QStringLiteral("【串口】自动重连成功"));
+        ui->LED1->setStyleSheet(QStringLiteral("background-color:green"));
+        ui->lineEdit->setText(QStringLiteral("已连接"));
+        ui->pushButton_2->setEnabled(true);
+        ui->pushButton_3->setEnabled(true);
+    });
+    connect(&m_serialController, &SerialController::deviceOnlineChanged, this,
+            [this](bool online) {
+        if (online) {
+            ui->plainTextEdit_2->appendPlainText(QStringLiteral("【串口】下位机已上线"));
+            m_lastRemoteMode = -1; // 强制下一帧遥测刷新模式显示（label_11 可能停留在"离线"）
+        } else {
+            ui->plainTextEdit_2->appendPlainText(
+                QStringLiteral("【串口】下位机无响应（遥测超时）"));
+            ui->label_11->setText(QStringLiteral("离线"));
+            ui->label_11->setStyleSheet(
+                QStringLiteral("color: gray; font-size: 14px; font-weight: bold;"));
+        }
+    });
+    connect(&m_serialController, &SerialController::commandFailed, this,
+            [this](uint8_t cmd) {
+        ui->plainTextEdit_2->appendPlainText(
+            QStringLiteral("【串口】命令 0x%1 发送失败（无 ACK）")
+                .arg(cmd, 2, 16, QLatin1Char('0')));
+    });
+
     ui->comboBox_4->clear();
-    ui->comboBox_4->addItem(QStringLiteral("YOLOv8s（精度优先）"), QStringLiteral("yolov8s.onnx"));
-    ui->comboBox_4->addItem(QStringLiteral("YOLOv8n（速度优先）"), QStringLiteral("yolov8n.onnx"));
+    ui->comboBox_4->addItem(QStringLiteral("YOLO26s（精度优先）"), QStringLiteral("yolo26s.onnx"));
+    ui->comboBox_4->addItem(QStringLiteral("YOLO26n（速度优先）"), QStringLiteral("yolo26n.onnx"));
     ui->comboBox_4->addItem(QStringLiteral("特征跟踪 CSRT+ORB（任意物体）"), QStringLiteral("feature"));
     connect(ui->comboBox_4, QOverload<int>::of(&QComboBox::currentIndexChanged),
             this, &MainWindow::onTrackingModelChanged);
@@ -145,12 +183,12 @@ MainWindow::~MainWindow()
 QString MainWindow::currentTrackingModelFileName() const
 {
     if (!ui || !ui->comboBox_4) {
-        return QStringLiteral("yolov8s.onnx");
+        return QStringLiteral("yolo26s.onnx");
     }
 
     const QString modelFileName = ui->comboBox_4->currentData().toString();
     if (modelFileName.isEmpty() || modelFileName == QStringLiteral("feature")) {
-        return QStringLiteral("yolov8s.onnx");
+        return QStringLiteral("yolo26s.onnx");
     }
     return modelFileName;
 }
@@ -182,12 +220,12 @@ void MainWindow::onTrackingModelChanged(int index)
     m_offsetY = 0;
     m_trackingEngine.stopTracking();
     if (wasAutoTracking) {
-        sendCommand(0x12);
+        sendCommand(SerialController::CmdTrackOff);
     }
 
     if (isFeatureTrackingSelected()) {
         m_trackingEngine.setTrackingBackend(true, QStringLiteral("feature"));
-        m_trackingEngine.setCurrentModel(QStringLiteral("yolov8s.onnx"));
+        m_trackingEngine.setCurrentModel(QStringLiteral("yolo26s.onnx"));
         ui->btnStartTracking->setEnabled(true);
         ui->btnStartTracking->setToolTip(QString());
         ui->plainTextEdit_2->appendPlainText(
@@ -220,17 +258,17 @@ void MainWindow::on_pushButton_clicked()
 
         if (m_serialController.openSerial(ui->comboBox->currentText(), ui->comboBox_2->currentText().toInt())) {
             ui->lineEdit->setText(QStringLiteral("已连接"));
+            m_lastRemoteMode = -1;
             disconnect(&m_serialController, &SerialController::telemetryReceived, this, nullptr);
             connect(&m_serialController, &SerialController::telemetryReceived, this,
-                    [this](int remoteMode, const QString& param1, const QString& param2) {
-                ui->plainTextEdit_3->setPlainText(param1);
-                ui->plainTextEdit_4->setPlainText(param2);
+                    [this](int remoteMode, float angle1, float angle2) {
+                ui->plainTextEdit_3->setPlainText(QString::number(angle1, 'f', 1));
+                ui->plainTextEdit_4->setPlainText(QString::number(angle2, 'f', 1));
 
-                static int lastRemoteMode = -1;
-                if (remoteMode == lastRemoteMode) {
+                if (remoteMode == m_lastRemoteMode) {
                     return;
                 }
-                lastRemoteMode = remoteMode;
+                m_lastRemoteMode = remoteMode;
 
                 {
                     QMutexLocker locker(&m_modeMutex);
@@ -267,6 +305,7 @@ void MainWindow::on_pushButton_clicked()
         ui->LED1->setStyleSheet(QStringLiteral("background-color:red"));
         disconnect(&m_serialController, &SerialController::telemetryReceived, this, nullptr);
         m_serialController.closeSerial();
+        m_lastRemoteMode = -1;
         ui->pushButton_2->setEnabled(false);
         ui->pushButton_3->setEnabled(false);
     }
@@ -341,7 +380,7 @@ cv::Mat MainWindow::QImageToCvMat(const QImage& qImage)
                 const_cast<uchar*>(converted.bits()), converted.bytesPerLine());
     cv::Mat bgr;
     cv::cvtColor(rgb, bgr, cv::COLOR_RGB2BGR);
-    return bgr.clone();
+    return bgr;
 }
 
 cv::Mat MainWindow::QVideoFrameToCvMat(const QVideoFrame &frame)
@@ -356,14 +395,12 @@ QImage MainWindow::CvMatToQImage(const cv::Mat& mat)
 {
     if (mat.empty()) return QImage();
     if (mat.type() == CV_8UC3) {
-        cv::Mat rgbMat;
-        cv::cvtColor(mat, rgbMat, cv::COLOR_BGR2RGB);
         return QImage(
-            reinterpret_cast<const uchar*>(rgbMat.data),
-            rgbMat.cols,
-            rgbMat.rows,
-            static_cast<qsizetype>(rgbMat.step),
-            QImage::Format_RGB888).copy();
+            reinterpret_cast<const uchar*>(mat.data),
+            mat.cols,
+            mat.rows,
+            static_cast<qsizetype>(mat.step),
+            QImage::Format_BGR888).copy();
     }
     if (mat.type() == CV_8UC1) {
         return QImage(
@@ -398,9 +435,19 @@ void MainWindow::handleNewVideoFrame(const QVideoFrame &frame)
 
 void MainWindow::processLatestVideoFrame()
 {
-    const auto resetFrameDispatch = qScopeGuard([this]() {
-        QMutexLocker locker(&m_pendingFrameMutex);
-        m_frameDispatchPending = false;
+    const auto finishFrameDispatch = qScopeGuard([this]() {
+        bool hasPendingFrame = false;
+        {
+            QMutexLocker locker(&m_pendingFrameMutex);
+            hasPendingFrame = m_pendingVideoFrame.isValid();
+            if (!hasPendingFrame) {
+                m_frameDispatchPending = false;
+            }
+        }
+        if (hasPendingFrame) {
+            QMetaObject::invokeMethod(
+                this, &MainWindow::processLatestVideoFrame, Qt::QueuedConnection);
+        }
     });
 
     QVideoFrame frame;
@@ -447,7 +494,7 @@ void MainWindow::processLatestVideoFrame()
     m_trackingEngine.setFrameSize(QSize(cvMat.cols, cvMat.rows));
     m_trackingEngine.processFrame(cvMat);
     if (m_cameraManager.state() != CameraManager::CameraState::Open) return;
-    m_lastFrame = cvMat.clone();
+    m_lastFrame = cvMat;
 
     const QImage img = CvMatToQImage(cvMat);
     if (!img.isNull()) {
@@ -512,16 +559,15 @@ void MainWindow::processLatestVideoFrame()
                 painter.drawText(scaledSelectRect.topLeft() + QPointF(5, -5), QStringLiteral("Select"));
             }
 
-            static qint64 lastFpsCalcTime = QDateTime::currentMSecsSinceEpoch();
-            static int frameCount = 0;
-            static int displayedFps = 0;
-
-            frameCount++;
             const qint64 now = QDateTime::currentMSecsSinceEpoch();
-            if (now - lastFpsCalcTime >= 1000) {
-                displayedFps = frameCount;
-                frameCount = 0;
-                lastFpsCalcTime = now;
+            if (m_lastFpsCalcTime == 0) {
+                m_lastFpsCalcTime = now;
+            }
+            ++m_fpsFrameCount;
+            if (now - m_lastFpsCalcTime >= 1000) {
+                m_displayedFps = m_fpsFrameCount;
+                m_fpsFrameCount = 0;
+                m_lastFpsCalcTime = now;
             }
 
             QFont fpsFont = painter.font();
@@ -529,9 +575,9 @@ void MainWindow::processLatestVideoFrame()
             fpsFont.setBold(true);
             painter.setFont(fpsFont);
             painter.setPen(Qt::black);
-            painter.drawText(32, 72, QStringLiteral("FPS: %1").arg(displayedFps));
+            painter.drawText(32, 72, QStringLiteral("FPS: %1").arg(m_displayedFps));
             painter.setPen(Qt::yellow);
-            painter.drawText(30, 70, QStringLiteral("FPS: %1").arg(displayedFps));
+            painter.drawText(30, 70, QStringLiteral("FPS: %1").arg(m_displayedFps));
 
             painter.end();
             ui->imageLabel->setPixmap(m_renderCanvas);
@@ -549,10 +595,9 @@ void MainWindow::processLatestVideoFrame()
         }
     }
 
-    static qint64 lastInfoUpdateTime = 0;
     const qint64 nowMs = QDateTime::currentMSecsSinceEpoch();
-    if (nowMs - lastInfoUpdateTime >= 100) {
-        lastInfoUpdateTime = nowMs;
+    if (nowMs - m_lastInfoUpdateTime >= 100) {
+        m_lastInfoUpdateTime = nowMs;
         if (m_isCapturing && !m_trackedRect.empty()) {
             QString info;
             info += QStringLiteral("X 偏移：%1\n").arg(m_offsetX);
@@ -605,7 +650,7 @@ void MainWindow::on_btnStartTracking_clicked()
     const bool useFeatureTracking = isFeatureTrackingSelected();
     if (!useFeatureTracking && !m_trackingEngine.yoloReady()) {
         ui->plainTextEdit_2->appendPlainText(
-            QStringLiteral("【错误】YOLO 模型加载失败，请检查程序目录或当前工作目录中的 yolov8s.onnx / yolov8n.onnx！"));
+            QStringLiteral("【错误】YOLO26 模型加载失败，请检查程序目录或当前工作目录中的 yolo26s.onnx / yolo26n.onnx！"));
         return;
     }
     if (!useFeatureTracking && !m_trackingEngine.yoloWarmedUp()) {
@@ -632,11 +677,11 @@ void MainWindow::on_btnStartTracking_clicked()
         useFeatureTracking ? QStringLiteral("feature") : currentTrackingModelFileName());
 
     if (ui->label_11->text() == QStringLiteral("自动")) {
-        sendCommand(0x11);
+        sendCommand(SerialController::CmdTrackOn);
     }
     ui->plainTextEdit_2->appendPlainText(
         useFeatureTracking ? QStringLiteral("开始特征跟踪（CSRT + ORB）！")
-                           : QStringLiteral("开始纯 YOLOv8 跟踪！"));
+                           : QStringLiteral("开始纯 YOLO26 跟踪！"));
 }
 
 void MainWindow::on_btnStopTracking_clicked()
@@ -664,7 +709,7 @@ void MainWindow::on_btnStopTracking_clicked()
         }
     }
     if (ui->label_11->text() == QStringLiteral("自动")) {
-        sendCommand(0x12);
+        sendCommand(SerialController::CmdTrackOff);
     }
     ui->plainTextEdit_2->appendPlainText(QStringLiteral("停止跟踪！"));
 }
@@ -816,7 +861,7 @@ void MainWindow::on_pushButton_2_clicked()
     m_isSelecting = false;
     m_offsetX = 0;
     m_offsetY = 0;
-    sendCommand(0x02);
+    sendCommand(SerialController::CmdCenter);
 }
 
 void MainWindow::on_pushButton_3_clicked()
@@ -844,7 +889,7 @@ void MainWindow::on_pushButton_3_clicked()
     m_isSelecting = false;
     m_offsetX = 0;
     m_offsetY = 0;
-    sendCommand(0x01);
+    sendCommand(SerialController::CmdSwitchMode);
 
     ui->pushButton_3->setEnabled(false);
     QTimer::singleShot(100, this, [this]() { ui->pushButton_3->setEnabled(true); });
@@ -859,8 +904,8 @@ void MainWindow::closeEvent(QCloseEvent *event)
 {
     m_trackingEngine.stopTracking();
     if (m_serialController.isOpen()) {
-        sendCommand(0x12);
-        sendCommand(0x02);
+        // 发送停止跟踪+回中并等待字节写出；即使丢包，下位机链路超时保护也会兜底回中
+        m_serialController.shutdownGimbal();
         m_serialController.closeSerial();
     }
     m_cameraManager.closeCamera();

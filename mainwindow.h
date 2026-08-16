@@ -10,25 +10,11 @@
 #include <QTimer>
 #include <QImage>
 #include <QPixmap>
-#include <QCamera>
-#include <QMediaCaptureSession>
-#include <QVideoWidget>
-#include <QVideoSink>
-#include <QMediaDevices>
-#include <QCameraDevice>
 #include <QMutex>
-#include <QThread>
 #include <QRect>
 #include <QCloseEvent>
-#include <QHash>
 
 #include <opencv2/opencv.hpp>
-#include <opencv2/dnn.hpp>
-#include <opencv2/features2d.hpp>
-#include <opencv2/tracking.hpp>
-#include <onnxruntime_cxx_api.h>
-
-using namespace cv;
 
 QT_BEGIN_NAMESPACE
 namespace Ui { class MainWindow; }
@@ -49,7 +35,7 @@ public:
     enum class TrackingBackend { Yolo, Feature };
 
     MainWindow(QWidget *parent = nullptr);
-    ~MainWindow();
+    ~MainWindow() override;
 
     /**
      * @brief 图像格式转换工具：QImage 转 OpenCV cv::Mat
@@ -150,6 +136,11 @@ private:
     bool m_waitingForRecover;                ///< 是否正处于丢失后等待恢复阶段
     QPixmap m_renderCanvas;                  ///< 界面重绘用的像素画布缓存
     qint64 m_lastSerialSendTime;             ///< 上次通过串口发送数据的毫秒时间戳
+    int m_lastRemoteMode = -1;               ///< 最近一次遥测模式，重连时会重置
+    qint64 m_lastFpsCalcTime = 0;            ///< FPS 统计窗口起始时间
+    int m_fpsFrameCount = 0;                 ///< 当前 FPS 窗口内帧数
+    int m_displayedFps = 0;                  ///< 最近一次计算出的显示帧率
+    qint64 m_lastInfoUpdateTime = 0;         ///< 追踪信息面板的节流时间戳
     int m_dnnFrameSkipCounter = 0;           ///< 跳帧计数器（降低刷新率）
     int m_lostFrameCount = 0;                ///< 丢失目标的持续帧数
 };

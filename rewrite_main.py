@@ -98,7 +98,7 @@ new_start_btn = """void MainWindow::on_btnStartTracking_clicked() {
     if(ui->label_11->text()=="自动") sendCommand(0x11);
     ui->plainTextEdit_2->appendPlainText(
         useFeatureTracking ? QStringLiteral("开始特征跟踪（CSRT + ORB）！")
-                           : QStringLiteral("开始纯 YOLOv8 跟踪！"));
+                           : QStringLiteral("开始纯 YOLO26 跟踪！"));
 }"""
 cpp_content = cpp_content[:idx_start] + new_start_btn + cpp_content[idx_end_start:]
 

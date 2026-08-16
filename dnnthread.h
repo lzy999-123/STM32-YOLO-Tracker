@@ -3,7 +3,7 @@
 
 #include <QThread>
 #include <QMutex>
-#include <QImage>
+#include <QWaitCondition>
 #include <opencv2/dnn.hpp>
 #include <opencv2/opencv.hpp>
 #include <onnxruntime_cxx_api.h>
@@ -97,6 +97,7 @@ protected:
 
 private:
     QMutex m_mutex;                       ///< 线程安全锁
+    QWaitCondition m_workAvailable;       ///< 有新推理任务时唤醒线程，避免空闲轮询
     QString m_modelFileName;              ///< 模型文件路径
     QString m_modelLoadError;             ///< 模型加载错误信息
     Ort::Env m_ortEnv{nullptr};           ///< ONNX Runtime 运行环境

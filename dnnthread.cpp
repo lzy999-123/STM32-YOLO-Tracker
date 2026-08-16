@@ -6,6 +6,7 @@
 #include <QStringList>
 
 #include <algorithm>
+#include <array>
 #include <cmath>
 #include <stdexcept>
 #include <utility>
@@ -47,6 +48,14 @@ cv::Rect2d boundedRect(const cv::Rect2d &rect, const cv::Size &frameSize)
         return cv::Rect2d();
     }
     return cv::Rect2d(left, top, right - left, bottom - top);
+}
+
+QString yoloClassName(int classId, const std::vector<std::string> &classNames)
+{
+    if (classId >= 0 && classId < static_cast<int>(classNames.size())) {
+        return QString::fromStdString(classNames[classId]);
+    }
+    return QStringLiteral("class_%1").arg(classId);
 }
 
 double smoothedYoloSize(double previous, double detected, double scale, bool snap)
@@ -137,7 +146,7 @@ DnnThread::DnnThread(const QString &modelFileName, QObject *parent)
     };
 
     try {
-        m_ortEnv = Ort::Env(ORT_LOGGING_LEVEL_WARNING, "YOLOv8");
+        m_ortEnv = Ort::Env(ORT_LOGGING_LEVEL_WARNING, "YOLO26");
         Ort::SessionOptions sessionOptions;
         sessionOptions.SetIntraOpNumThreads(4); // 将线程数由 1 改为 4，大幅提升 CPU 模式下的 FPS
         sessionOptions.SetGraphOptimizationLevel(GraphOptimizationLevel::ORT_ENABLE_ALL);
@@ -151,22 +160,39 @@ DnnThread::DnnThread(const QString &modelFileName, QObject *parent)
             qDebug() << "配置 CUDA 失败，将回退到 CPU!";
         }
         const QStringList modelCandidates = m_modelFileName.isEmpty()
-                                                ? QStringList{QStringLiteral("yolov8s.onnx"), QStringLiteral("yolov8n.onnx")}
+                                                ? QStringList{QStringLiteral("yolo26s.onnx"), QStringLiteral("yolo26n.onnx")}
                                                 : QStringList{m_modelFileName};
+        QStringList modelSearchDirs;
+        auto addSearchDir = [&modelSearchDirs](const QString &path) {
+            const QString cleanPath = QDir(path).absolutePath();
+            if (!modelSearchDirs.contains(cleanPath)) {
+                modelSearchDirs << cleanPath;
+            }
+        };
+        auto addSearchDirWithParents = [&addSearchDir](const QString &path) {
+            QDir dir(path);
+            for (int i = 0; i < 4; ++i) {
+                addSearchDir(dir.absolutePath());
+                if (!dir.cdUp()) {
+                    break;
+                }
+            }
+        };
+        addSearchDirWithParents(QCoreApplication::applicationDirPath());
+        addSearchDirWithParents(QDir::currentPath());
+
         QString modelPath;
         QStringList checkedModelPaths;
-        for (const QString& modelName : modelCandidates) {
-            const QString appPath = QDir(QCoreApplication::applicationDirPath()).filePath(modelName);
-            checkedModelPaths << appPath;
-            if (QFileInfo::exists(appPath)) {
-                modelPath = appPath;
-                break;
+        for (const QString &modelName : std::as_const(modelCandidates)) {
+            for (const QString &searchDir : std::as_const(modelSearchDirs)) {
+                const QString candidatePath = QDir(searchDir).filePath(modelName);
+                checkedModelPaths << candidatePath;
+                if (QFileInfo::exists(candidatePath)) {
+                    modelPath = candidatePath;
+                    break;
+                }
             }
-
-            const QString developmentPath = QDir::current().filePath(modelName);
-            checkedModelPaths << developmentPath;
-            if (QFileInfo::exists(developmentPath)) {
-                modelPath = developmentPath;
+            if (!modelPath.isEmpty()) {
                 break;
             }
         }
@@ -212,6 +238,7 @@ DnnThread::DnnThread(const QString &modelFileName, QObject *parent)
 
 DnnThread::~DnnThread() {
     requestInterruption();
+    m_workAvailable.wakeAll();
     wait();
     if (m_ortSession) {
         delete m_ortSession;
@@ -230,6 +257,7 @@ void DnnThread::requestDetections(const cv::Mat &frame, quint64 requestId) {
     m_detectFrame = frame.clone();
     m_detectionRequestId = requestId;
     m_needDetection = true;
+    m_workAvailable.wakeOne();
 }
 
 void DnnThread::updateDnn(const cv::Mat &frame) {
@@ -237,6 +265,7 @@ void DnnThread::updateDnn(const cv::Mat &frame) {
     if (!m_isTracking || frame.empty()) return;
     m_frame = frame;
     m_hasNewFrame = true;
+    m_workAvailable.wakeOne();
 }
 
 
@@ -247,6 +276,7 @@ void DnnThread::initDnn(const cv::Mat &frame, const cv::Rect2d &target) {
     m_initRect = target;
     m_needInit = true;
     m_isTracking = true;
+    m_workAvailable.wakeOne();
 }
 
 
@@ -262,6 +292,7 @@ void DnnThread::stopDnn() {
     m_useYolo = false;
     m_lockedClassId = -1;
     m_dnnMissCount = 0;
+    m_workAvailable.wakeAll();
 }
 
 
@@ -337,6 +368,16 @@ void DnnThread::run() {
 
         {
             QMutexLocker locker(&m_mutex);
+            while (!isInterruptionRequested() &&
+                   !m_needDetection &&
+                   !m_needInit &&
+                   !m_hasNewFrame) {
+                m_workAvailable.wait(&m_mutex);
+            }
+            if (isInterruptionRequested()) {
+                break;
+            }
+
             if (m_needDetection) {
                 doDetection = true;
                 detectionRequestId = m_detectionRequestId;
@@ -355,11 +396,8 @@ void DnnThread::run() {
                 doUpdate = true;
                 m_hasNewFrame = false;
                 processFrame = m_frame;
+                m_frame.release();
                 m_isComputing = true;
-            } else {
-                locker.unlock();
-                msleep(10);
-                continue;
             }
         }
 
@@ -373,9 +411,14 @@ void DnnThread::run() {
         cv::Mat blob;
         cv::dnn::blobFromImage(processFrame, blob, 1.0 / 255.0, cv::Size(640, 640), cv::Scalar(), true, false);
         
-        std::vector<int64_t> input_dims = {1, 3, 640, 640};
+        const std::array<int64_t, 4> input_dims = {1, 3, 640, 640};
         auto memory_info = Ort::MemoryInfo::CreateCpu(OrtDeviceAllocator, OrtMemTypeCPU);
-        Ort::Value input_tensor = Ort::Value::CreateTensor<float>(memory_info, (float*)blob.data, blob.total(), input_dims.data(), input_dims.size());
+        Ort::Value input_tensor = Ort::Value::CreateTensor<float>(
+            memory_info,
+            reinterpret_cast<float *>(blob.data),
+            blob.total(),
+            input_dims.data(),
+            input_dims.size());
 
         std::vector<Ort::Value> output_tensors;
         try {
@@ -403,10 +446,25 @@ void DnnThread::run() {
         auto output_info = output_tensors[0].GetTensorTypeAndShapeInfo();
         auto output_dims = output_info.GetShape();
         if (output_info.GetElementType() != ONNX_TENSOR_ELEMENT_DATA_TYPE_FLOAT ||
-            output_dims.size() != 3 ||
-            output_dims[0] != 1 ||
-            output_dims[1] <= 0 ||
-            output_dims[2] <= 0) {
+            output_dims.empty()) {
+            qDebug() << "不支持的 YOLO 输出结构";
+            QMutexLocker locker(&m_mutex);
+            m_isComputing = false;
+            m_useYolo = false;
+            continue;
+        }
+
+        int outputRows = 0;
+        int outputCols = 0;
+        if (output_dims.size() == 3 && output_dims[0] == 1 &&
+            output_dims[1] > 0 && output_dims[2] > 0) {
+            outputRows = static_cast<int>(output_dims[1]);
+            outputCols = static_cast<int>(output_dims[2]);
+        } else if (output_dims.size() == 2 &&
+                   output_dims[0] > 0 && output_dims[1] > 0) {
+            outputRows = static_cast<int>(output_dims[0]);
+            outputCols = static_cast<int>(output_dims[1]);
+        } else {
             qDebug() << "不支持的 YOLO 输出结构";
             QMutexLocker locker(&m_mutex);
             m_isComputing = false;
@@ -415,32 +473,9 @@ void DnnThread::run() {
         }
 
         float* output_data = output_tensors[0].GetTensorMutableData<float>();
-        int r = output_dims[1]; // 84
-        int c = output_dims[2]; // 8400
-        cv::Mat output2d(r, c, CV_32F, output_data);
-        
-        // 自动识别正确的行列方向：YOLOv8 框数肯定是几千 (比如 8400)，特征数是几十 (比如 84)
-        cv::Mat outputT;
-        if (output2d.rows > output2d.cols) {
-            outputT = output2d;
-        } else {
-            outputT = output2d.t(); // 现在 output2d 绝对是 2D 的，转置不会再崩溃
-            outputT = outputT.clone(); // 极其关键：转置后必须深拷贝，否则内存不连续会导致下面读取全错！
-        }
-
-
-        // 防崩溃：确保张量特征维度至少包含 cx,cy,w,h 以及至少一个类别的分数
-        if (outputT.cols < 5 || outputT.rows < 10) {
-            QMutexLocker locker(&m_mutex);
-            m_isComputing = false;
-            m_useYolo = false;
-            continue;
-        }
-
-        float x_factor = processFrame.cols / 640.0f;
-        float y_factor = processFrame.rows / 640.0f;
-        int num_classes = outputT.cols - 4;
-
+        cv::Mat output2d(outputRows, outputCols, CV_32F, output_data);
+        const float x_factor = processFrame.cols / 640.0f;
+        const float y_factor = processFrame.rows / 640.0f;
         std::vector<int> classIds;
         std::vector<float> confidences;
         std::vector<cv::Rect> boxes;
@@ -449,96 +484,172 @@ void DnnThread::run() {
             QMutexLocker locker(&m_mutex);
             activeLockedClass = m_lockedClassId;
         }
+        int num_classes = static_cast<int>(m_classNames.size());
+        bool nmsAlreadyApplied = false;
 
-        for (int i = 0; i < outputT.rows; ++i) {
-            float* row = outputT.ptr<float>(i);
-            float* classes_scores = row + 4;
-            
-            // 极速循环：替代原来耗时的 cv::minMaxLoc (8400次调用会拖慢近15毫秒！)
-            float max_class_score = classes_scores[0];
-            int best_class_id = 0;
-            for (int c = 1; c < num_classes; ++c) {
-                if (classes_scores[c] > max_class_score) {
-                    max_class_score = classes_scores[c];
-                    best_class_id = c;
-                }
+        auto appendXyxyDetection = [&](float leftRaw,
+                                       float topRaw,
+                                       float rightRaw,
+                                       float bottomRaw,
+                                       float confidence,
+                                       int classId) {
+            if (classId < 0 || confidence <= confidenceThresholdForClass(classId, activeLockedClass)) {
+                return;
+            }
+            if (!std::isfinite(leftRaw) || !std::isfinite(topRaw) ||
+                !std::isfinite(rightRaw) || !std::isfinite(bottomRaw) ||
+                !std::isfinite(confidence)) {
+                return;
             }
 
-            std::vector<std::pair<int, float>> rowCandidates;
-            auto addCandidate = [&](int classId, float score) {
-                if (classId < 0 || classId >= num_classes) return;
-                if (score <= confidenceThresholdForClass(classId, activeLockedClass)) return;
-                for (auto& candidate : rowCandidates) {
-                    if (candidate.first == classId) {
-                        candidate.second = std::max(candidate.second, score);
-                        return;
+            if (std::max({std::abs(leftRaw), std::abs(topRaw), std::abs(rightRaw), std::abs(bottomRaw)}) <= 2.0f) {
+                leftRaw *= 640.0f;
+                topRaw *= 640.0f;
+                rightRaw *= 640.0f;
+                bottomRaw *= 640.0f;
+            }
+
+            float left = leftRaw;
+            float top = topRaw;
+            float right = rightRaw;
+            float bottom = bottomRaw;
+            if (right <= left || bottom <= top) {
+                const float cx = leftRaw;
+                const float cy = topRaw;
+                const float w = rightRaw;
+                const float h = bottomRaw;
+                if (w <= 1.0f || h <= 1.0f) {
+                    return;
+                }
+                left = cx - 0.5f * w;
+                top = cy - 0.5f * h;
+                right = cx + 0.5f * w;
+                bottom = cy + 0.5f * h;
+            }
+
+            const int x = static_cast<int>(left * x_factor);
+            const int y = static_cast<int>(top * y_factor);
+            const int width = static_cast<int>((right - left) * x_factor);
+            const int height = static_cast<int>((bottom - top) * y_factor);
+            if (width <= 1 || height <= 1) {
+                return;
+            }
+            classIds.push_back(classId);
+            confidences.push_back(confidence);
+            boxes.push_back(cv::Rect(x, y, width, height));
+        };
+
+        if (output2d.cols == 6 || output2d.rows == 6) {
+            cv::Mat detections = output2d;
+            if (output2d.cols != 6) {
+                detections = output2d.t();
+                detections = detections.clone();
+            }
+            nmsAlreadyApplied = true;
+            for (int i = 0; i < detections.rows; ++i) {
+                const float *row = detections.ptr<float>(i);
+                const float confidence = row[4];
+                const int classId = cvRound(row[5]);
+                appendXyxyDetection(row[0], row[1], row[2], row[3], confidence, classId);
+            }
+        } else {
+            cv::Mat outputT;
+            if (output2d.rows > output2d.cols) {
+                outputT = output2d;
+            } else {
+                outputT = output2d.t();
+                outputT = outputT.clone();
+            }
+
+            if (outputT.cols < 5 || outputT.rows < 10) {
+                QMutexLocker locker(&m_mutex);
+                m_isComputing = false;
+                m_useYolo = false;
+                continue;
+            }
+
+            num_classes = outputT.cols - 4;
+            for (int i = 0; i < outputT.rows; ++i) {
+                float* row = outputT.ptr<float>(i);
+                float* classes_scores = row + 4;
+
+                float max_class_score = classes_scores[0];
+                int best_class_id = 0;
+                for (int c = 1; c < num_classes; ++c) {
+                    if (classes_scores[c] > max_class_score) {
+                        max_class_score = classes_scores[c];
+                        best_class_id = c;
                     }
                 }
-                rowCandidates.push_back({classId, score});
-            };
 
-            addCandidate(best_class_id, max_class_score);
-            if (kBottleClassId < num_classes) {
-                addCandidate(kBottleClassId, classes_scores[kBottleClassId]);
-            }
-            if (activeLockedClass >= 0 && activeLockedClass < num_classes) {
-                addCandidate(activeLockedClass, classes_scores[activeLockedClass]);
-            }
+                std::array<int, 3> candidateClassIds{};
+                std::array<float, 3> candidateScores{};
+                int candidateCount = 0;
+                auto addCandidate = [&](int classId, float score) {
+                    if (classId < 0 || classId >= num_classes) return;
+                    if (score <= confidenceThresholdForClass(classId, activeLockedClass)) return;
+                    for (int candidateIndex = 0; candidateIndex < candidateCount; ++candidateIndex) {
+                        if (candidateClassIds[candidateIndex] == classId) {
+                            candidateScores[candidateIndex] =
+                                std::max(candidateScores[candidateIndex], score);
+                            return;
+                        }
+                    }
+                    if (candidateCount < static_cast<int>(candidateClassIds.size())) {
+                        candidateClassIds[candidateCount] = classId;
+                        candidateScores[candidateCount] = score;
+                        ++candidateCount;
+                    }
+                };
 
-            if (!rowCandidates.empty()) {
-                float cx = row[0];
-                float cy = row[1];
-                float w = row[2];
-                float h = row[3];
-                
-                // 防御性处理：如果坐标是归一化的 (0~1)，我们需要将其映射回 640x640
-                if (cx <= 2.0f && cy <= 2.0f && w <= 2.0f && h <= 2.0f) {
-                    cx *= 640.0f;
-                    cy *= 640.0f;
-                    w *= 640.0f;
-                    h *= 640.0f;
+                addCandidate(best_class_id, max_class_score);
+                if (kBottleClassId < num_classes) {
+                    addCandidate(kBottleClassId, classes_scores[kBottleClassId]);
                 }
-                
-                if (!std::isfinite(cx) || !std::isfinite(cy) ||
-                    !std::isfinite(w) || !std::isfinite(h)) {
-                    continue;
+                if (activeLockedClass >= 0 && activeLockedClass < num_classes) {
+                    addCandidate(activeLockedClass, classes_scores[activeLockedClass]);
                 }
-                int left = int((cx - 0.5 * w) * x_factor);
-                int top = int((cy - 0.5 * h) * y_factor);
-                int width = int(w * x_factor);
-                int height = int(h * y_factor);
-                if (width <= 1 || height <= 1) continue;
 
-                for (const auto& candidate : rowCandidates) {
-                    classIds.push_back(candidate.first);
-                    confidences.push_back(candidate.second);
-                    boxes.push_back(cv::Rect(left, top, width, height));
+                if (candidateCount > 0) {
+                    float cx = row[0];
+                    float cy = row[1];
+                    float w = row[2];
+                    float h = row[3];
+
+                    if (cx <= 2.0f && cy <= 2.0f && w <= 2.0f && h <= 2.0f) {
+                        cx *= 640.0f;
+                        cy *= 640.0f;
+                        w *= 640.0f;
+                        h *= 640.0f;
+                    }
+
+                    if (!std::isfinite(cx) || !std::isfinite(cy) ||
+                        !std::isfinite(w) || !std::isfinite(h)) {
+                        continue;
+                    }
+                    int left = int((cx - 0.5 * w) * x_factor);
+                    int top = int((cy - 0.5 * h) * y_factor);
+                    int width = int(w * x_factor);
+                    int height = int(h * y_factor);
+                    if (width <= 1 || height <= 1) continue;
+
+                    for (int candidateIndex = 0; candidateIndex < candidateCount; ++candidateIndex) {
+                        classIds.push_back(candidateClassIds[candidateIndex]);
+                        confidences.push_back(candidateScores[candidateIndex]);
+                        boxes.push_back(cv::Rect(left, top, width, height));
+                    }
                 }
             }
         }
 
         std::vector<int> indices;
-        for (int classId = 0; classId < num_classes; ++classId) {
-            std::vector<cv::Rect> classBoxes;
-            std::vector<float> classConfidences;
-            std::vector<int> originalIndices;
-            for (int i = 0; i < static_cast<int>(classIds.size()); ++i) {
-                if (classIds[i] == classId) {
-                    classBoxes.push_back(boxes[i]);
-                    classConfidences.push_back(confidences[i]);
-                    originalIndices.push_back(i);
-                }
+        if (nmsAlreadyApplied) {
+            for (int i = 0; i < static_cast<int>(boxes.size()); ++i) {
+                indices.push_back(i);
             }
-            if (classBoxes.empty()) continue;
-
-            std::vector<int> classNmsIndices;
-            cv::dnn::NMSBoxes(
-                classBoxes, classConfidences, 0.0f, kNmsThreshold, classNmsIndices);
-            for (int nmsIdx : classNmsIndices) {
-                if (nmsIdx >= 0 && nmsIdx < static_cast<int>(originalIndices.size())) {
-                    indices.push_back(originalIndices[nmsIdx]);
-                }
-            }
+        } else if (!boxes.empty()) {
+            cv::dnn::NMSBoxesBatched(
+                boxes, confidences, classIds, 0.0f, kNmsThreshold, indices);
         }
 
         if (doDetection) {
@@ -624,7 +735,6 @@ void DnnThread::run() {
             if (best_idx != -1 &&
                 best_idx < static_cast<int>(classIds.size()) &&
                 classIds[best_idx] >= 0 &&
-                classIds[best_idx] < static_cast<int>(m_classNames.size()) &&
                 boxes[best_idx].width > 0 &&
                 boxes[best_idx].height > 0) {
                 m_lockedClassId = classIds[best_idx];
@@ -635,7 +745,7 @@ void DnnThread::run() {
                     cv::Rect2d(bestBox.x, bestBox.y, bestBox.width, bestBox.height),
                     processFrame.size());
 
-                QString cName = QString::fromStdString(m_classNames[m_lockedClassId]);
+                QString cName = yoloClassName(m_lockedClassId, m_classNames);
                 emit dnnTrackedResult(m_lastYoloRect, true, "LOCK:" + cName); // 特殊前缀用于触发锁定日志
             } else {
                 m_useYolo = false;
@@ -728,8 +838,7 @@ void DnnThread::run() {
                     }
 
                     if (best_idx != -1 && (min_dist <= maxTrackingDistance || acceptedByRecovery) &&
-                        lockedClass >= 0 &&
-                        lockedClass < static_cast<int>(m_classNames.size())) {
+                        lockedClass >= 0) {
                         cv::Rect best_r = boxes[best_idx];
                         cv::Rect2d detectedRect(best_r.x, best_r.y, best_r.width, best_r.height);
                         const bool recoveredAfterMiss =
@@ -745,7 +854,7 @@ void DnnThread::run() {
                             m_dnnMissCount = 0;
                         }
 
-                        QString cName = QString::fromStdString(m_classNames[lockedClass]);
+                        QString cName = yoloClassName(lockedClass, m_classNames);
                         emit dnnTrackedResult(
                             outputRect,
                             true,

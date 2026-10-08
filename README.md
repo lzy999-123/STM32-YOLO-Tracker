@@ -18,6 +18,12 @@
 *   `trackingengine.cpp/h`：实现多目标追踪及框选逻辑。
 *   `serialcontroller.cpp/h`：串口通信封装模块。
 
+## 学习记录与项目总结
+
+每次提交都同步保存一份学习报告，记录完成的工作、学到的知识、故障与解决过程、验证结果和以后需要注意的事项。
+报告索引见 [docs/learning](docs/learning/README.md)，首份报告覆盖Luckfox无线视频与自动识别阶段。
+项目全部完成后，依据历次报告填写 [项目最终总结](docs/learning/PROJECT_SUMMARY.md)。持续维护约定见 [AGENTS.md](AGENTS.md)。
+
 ## 部署说明
 
 最新阶段进展和验证范围见 [2026-10-08 阶段记录](MILESTONE_2026-10-08.md)。

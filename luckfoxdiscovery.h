@@ -6,6 +6,7 @@
 #include <QTimer>
 #include <QList>
 #include <QHostAddress>
+#include <QElapsedTimer>
 
 class LuckfoxDiscovery : public QObject
 {
@@ -26,6 +27,7 @@ private:
     QUdpSocket m_socket;
     QTimer m_retry;
     QTimer m_deadline;
+    QElapsedTimer m_elapsed;
     QList<QHostAddress> m_broadcasts;
     QList<quint32> m_subnets;
     QString m_nonce;

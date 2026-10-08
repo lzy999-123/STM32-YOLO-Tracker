@@ -173,8 +173,9 @@ private:
     qint64 m_lastFpsCalcTime = 0;            ///< FPS 统计窗口起始时间
     int m_fpsFrameCount = 0;                 ///< 当前 FPS 窗口内帧数
     int m_displayedFps = 0;                  ///< 最近一次计算出的显示帧率
+    qint64 m_lastFpsLogTime = 0;             ///< 显示帧率诊断日志每五秒输出一次
     qint64 m_lastInfoUpdateTime = 0;         ///< 追踪信息面板的节流时间戳
-    qint64 m_lastDisplayFrameTime = 0;      ///< 最近一次显示帧时间戳，限制界面最多 30 FPS
+    qint64 m_lastDisplayFrameTime = 0;      ///< 最近一次显示帧时间戳，用于本地摄像头节流
     int m_dnnFrameSkipCounter = 0;           ///< 跳帧计数器（降低刷新率）
     int m_lostFrameCount = 0;                ///< 丢失目标的持续帧数
 

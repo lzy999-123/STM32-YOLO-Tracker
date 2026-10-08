@@ -6,6 +6,7 @@
 #include <QDebug>
 #include <QMutexLocker>
 #include <QCoreApplication>
+#include <QLibrary>
 #include <opencv2/opencv.hpp>
 #include <utility>
 #include <chrono>
@@ -44,6 +45,10 @@ CameraManager::~CameraManager()
 {
     m_cameraCheckTimer->stop();
     safeDeleteCamera(); // 确保安全释放摄像头资源
+    // worker 使用本对象；析构前必须等待退出，不能 detach 后释放成员。
+    for (auto &worker : m_retiredRtspThreads) {
+        if (worker.joinable()) worker.join();
+    }
 }
 
 void CameraManager::startChecking()
@@ -96,12 +101,9 @@ void CameraManager::stopRtspStream()
 
     if (m_rtspThread) {
         if (m_rtspThread->joinable()) {
-            // 在独立后台线程中安全等待 worker 退出并释放资源，绝不阻塞 Qt GUI 主线程！
-            std::thread([t = std::move(m_rtspThread)]() mutable {
-                if (t && t->joinable()) {
-                    t->join();
-                }
-            }).detach();
+            // 关闭/切换不等待网络读取；析构时统一 join，避免后台访问已释放对象。
+            m_retiredRtspThreads.emplace_back(std::move(*m_rtspThread));
+            m_rtspThread.reset();
         } else {
             m_rtspThread.reset();
         }
@@ -111,10 +113,10 @@ void CameraManager::stopRtspStream()
 
 void CameraManager::notifyNewMat(quint64 sessionId)
 {
-    m_rtspDispatchPending.store(false, std::memory_order_release);
     if (sessionId != m_rtspSessionId.load()) {
         return; // 已经切换到新视频流，废弃旧流残留通知！
     }
+    m_rtspDispatchPending.store(false, std::memory_order_release);
 
     cv::Mat mat;
     {
@@ -132,81 +134,65 @@ void CameraManager::rtspWorkerLoop(const QString &url, quint64 sessionId)
 {
     if (sessionId != m_rtspSessionId.load() || !m_rtspRunning.load()) return;
 
-    // 画面只要求 720P，全链路极致压榨延迟（目标 0 延迟）
-    // 1. 底层解码参数深度调优：
-    //    - fflags;nobuffer + flush_packets;1: 解复用器绝对零缓冲，收到包立即交付解码器
-    //    - flags;low_delay: 激活低延迟解码，不等待 B 帧参考
-    //    - max_delay;0: 强制最大解复用延时为 0 微秒（默认是 500000 即 0.5s！）
-    //    - reorder_queue_size;0: 禁用 RTP 乱序重排缓冲区
-    //    - probesize;32 + analyzeduration;0: 极速分析无探针耗时
-    //    - sync;ext: 外部时钟无同步停顿
-    //    - threads;1: 单线程解码杜绝多线程解码管道自带的 N 帧延迟排队！
-    // 画面要求 720P，全链路极致压榨延迟（目标毫秒级实时）
-    // 1. 底层解码参数深度调优：
-    //    - rtsp_transport;tcp: 优先稳定 TCP 传输，杜绝 UDP 超时回退卡顿与花屏
-    //    - buffer_size;102400: 严控底层 socket 接收缓存大小，杜绝操作系统无序堆积历史帧
-    //    - fflags;nobuffer + flush_packets;1: 解复用器绝对零缓冲，收到包立即交付解码器
-    //    - flags;low_delay: 激活低延迟解码，不等待 B 帧参考
-    //    - max_delay;0: 强制最大解复用延时为 0 微秒
-    //    - reorder_queue_size;0: 禁用 RTP 乱序重排缓冲区
-    //    - probesize;32 + analyzeduration;0: 极速分析无探针耗时
-    //    - sync;ext: 外部时钟无同步停顿
-    //    - threads;1: 单线程解码杜绝多线程解码管道自带的 N 帧延迟排队！
+    const auto streamStart = std::chrono::steady_clock::now();
+    // 只分析视频；短而非零的探测窗口避免等待无数据的音轨。
+    // 保留探测期获得的关键帧，避免 nobuffer 丢弃它后再等待一个 GOP。
+    // 不使用 avioflags=direct；让 FFmpeg 正常解析 TCP interleaved 数据。
+    // options 中的 threads 不会传给此版本的解码器，线程数通过 open 参数设置。
     static const std::string s_tcpOptions =
         "rtsp_transport;tcp|"
+        "allowed_media_types;video|"
         "buffer_size;102400|"
-        "avioflags;direct|"
-        "fflags;nobuffer|"
-        "flags;low_delay|"
         "max_delay;0|"
         "reorder_queue_size;0|"
-        "probesize;32|"
-        "analyzeduration;0|"
-        "sync;ext|"
-        "flush_packets;1|"
-        "threads;1|"
-        "timeout;2000000";
+        "probesize;32768|"
+        "analyzeduration;100000|"
+        "fpsprobesize;0";
 
     static const std::string s_udpOptions =
         "rtsp_transport;udp|"
-        "buffer_size;102400|"
-        "fifo_size;200000|"
-        "avioflags;direct|"
-        "fflags;nobuffer|"
-        "flags;low_delay|"
-        "max_delay;0|"
-        "reorder_queue_size;0|"
-        "probesize;32|"
-        "analyzeduration;0|"
-        "sync;ext|"
-        "flush_packets;1|"
-        "threads;1|"
-        "timeout;2000000";
+        "allowed_media_types;video|"
+        "buffer_size;262144|"
+        "max_delay;100000|"
+        "reorder_queue_size;64|"
+        "probesize;32768|"
+        "analyzeduration;100000|"
+        "fpsprobesize;0";
 
     auto setFfmpegOptions = [](const std::string &options) {
         qputenv("OPENCV_FFMPEG_CAPTURE_OPTIONS", QByteArray::fromStdString(options));
         _putenv_s("OPENCV_FFMPEG_CAPTURE_OPTIONS", options.c_str());
-        static std::string environmentValue;
-        environmentValue = "OPENCV_FFMPEG_CAPTURE_OPTIONS=" + options;
-        _putenv(environmentValue.c_str());
+        // FFmpeg 插件使用 msvcrt.dll 的 getenv，Qt/MSVC 使用 UCRT。
+        // 两者各有环境副本，仅更新 UCRT 会使插件继续使用默认五秒探测。
+        static QLibrary ffmpegCrt(QStringLiteral("msvcrt"));
+        using PutEnv = int (__cdecl *)(const char *);
+        static const auto putPluginEnv = reinterpret_cast<PutEnv>(ffmpegCrt.resolve("_putenv"));
+        const std::string environmentValue = "OPENCV_FFMPEG_CAPTURE_OPTIONS=" + options;
+        if (!putPluginEnv || putPluginEnv(environmentValue.c_str()) != 0) {
+            qWarning() << "[CameraManager] 无法设置 FFmpeg 插件的环境参数";
+        }
     };
 
-    // 针对 Luckfox RTSP 架构，优先采用 TCP interleaved 避免握手回退损耗
+    // 环境参数是进程全局的；串行化打开，防止取消后旧会话与新会话相互覆盖。
+    static std::mutex openMutex;
+    std::unique_lock<std::mutex> openLock(openMutex);
+    if (sessionId != m_rtspSessionId.load() || !m_rtspRunning.load()) return;
     setFfmpegOptions(s_tcpOptions);
-
-    qDebug() << "[CameraManager] 启用 720P 零延迟极速取流方案 (优先TCP):" << url;
-
+    qDebug() << "[CameraManager] 开始 720P 低延迟取流 (TCP):" << url;
     cv::VideoCapture cap;
-    cap.open(url.toStdString(), cv::CAP_FFMPEG);
-    cap.set(cv::CAP_PROP_BUFFERSIZE, 1);
+    const std::vector<int> openParams{
+        cv::CAP_PROP_OPEN_TIMEOUT_MSEC, 5000,
+        cv::CAP_PROP_READ_TIMEOUT_MSEC, 2000,
+        cv::CAP_PROP_N_THREADS, 1};
+    cap.open(url.toStdString(), cv::CAP_FFMPEG, openParams);
 
     if (!cap.isOpened() && m_rtspRunning.load() && sessionId == m_rtspSessionId.load()) {
         qWarning() << "[CameraManager] TCP RTSP 打开失败，回退 UDP:" << url;
         cap.release();
         setFfmpegOptions(s_udpOptions);
-        cap.open(url.toStdString(), cv::CAP_FFMPEG);
-        cap.set(cv::CAP_PROP_BUFFERSIZE, 1);
+        cap.open(url.toStdString(), cv::CAP_FFMPEG, openParams);
     }
+    openLock.unlock();
 
     if (sessionId != m_rtspSessionId.load() || !m_rtspRunning.load()) {
         cap.release();
@@ -222,12 +208,16 @@ void CameraManager::rtspWorkerLoop(const QString &url, quint64 sessionId)
             emit stateChanged(m_cameraState);
             emit cameraError(QStringLiteral("无法连接 RTSP 视频流，请检查设备 IP 与网络状态"));
         }, Qt::QueuedConnection);
-        m_rtspRunning.store(false);
+        if (sessionId == m_rtspSessionId.load()) m_rtspRunning.store(false);
         return;
     }
+    qDebug() << "[CameraManager] RTSP open_ms="
+             << std::chrono::duration_cast<std::chrono::milliseconds>(
+                    std::chrono::steady_clock::now() - streamStart).count()
+             << "decoder_threads=" << cap.get(cv::CAP_PROP_N_THREADS);
 
     // RTSP 能够成功打开即表示无线图像通道已经建立。
-    // 缓存冲刷和首帧格式校验属于后续媒体处理，不应延迟连接状态上报。
+    // 首帧解码和格式校验属于后续媒体处理，不应延迟连接状态上报。
     m_lastFrameTime.store(QDateTime::currentMSecsSinceEpoch());
     QMetaObject::invokeMethod(this, [this, sessionId]() {
         if (sessionId != m_rtspSessionId.load() || !m_rtspRunning.load()) return;
@@ -236,57 +226,17 @@ void CameraManager::rtspWorkerLoop(const QString &url, quint64 sessionId)
         emit stateChanged(m_cameraState);
     }, Qt::QueuedConnection);
 
-    // 关键核心：冲刷排空建联期间在 TCP 协议栈中积压的 100~150 帧历史陈旧帧（消除建联产生的巨大初始延迟）
-    // 算法原理：
-    // 首帧存在约 50ms 解码器初始化耗时；
-    // 积压的旧帧在内存中读取极快（< 10ms）；
-    // 连续排空超过 10 帧后，当单次 grab 耗时 > 20ms 时，说明底层缓存已彻底排空，正在等待摄像头最新拍摄的实时帧！
-    int drained = 0;
-    const auto tDrainStart = std::chrono::steady_clock::now();
-    while (m_rtspRunning.load() && sessionId == m_rtspSessionId.load() && drained < 500) {
-        const auto tGrabStart = std::chrono::steady_clock::now();
-        if (!cap.grab()) break;
-        const auto tElapsedMs = std::chrono::duration_cast<std::chrono::milliseconds>(
-            std::chrono::steady_clock::now() - tGrabStart).count();
-        drained++;
-        if (drained > 10 && tElapsedMs > 20) {
-            qDebug() << "[CameraManager] 成功冲刷排空" << drained << "帧历史陈旧积压缓存，直达 0 延迟实时画面，耗时:"
-                     << std::chrono::duration_cast<std::chrono::milliseconds>(std::chrono::steady_clock::now() - tDrainStart).count() << "ms";
-            break;
-        }
-    }
-
-    if (sessionId != m_rtspSessionId.load() || !m_rtspRunning.load()) {
-        cap.release();
-        return;
-    }
-
-    // 立即刷新时间戳，防止开流耗时被误判为超时断流
-    m_lastFrameTime.store(QDateTime::currentMSecsSinceEpoch());
-
+    // 首帧立即交付。持续解码并覆盖最新帧，GUI 忙时只丢弃待显示的旧帧。
+    // grab() 耗时不能代表帧龄；额外 grab() 会消耗下一帧，30 FPS 因而变成约 15 FPS。
     cv::Mat frame;
+    bool firstFrame = true;
+    auto statsStart = std::chrono::steady_clock::now();
+    int decodedFrames = 0;
     while (m_rtspRunning.load() && sessionId == m_rtspSessionId.load()) {
         if (!cap.grab()) {
             if (!m_rtspRunning.load() || sessionId != m_rtspSessionId.load()) break;
             std::this_thread::sleep_for(std::chrono::milliseconds(1));
             continue;
-        }
-
-        // 持续实时追赶机制：
-        // 正常 30 FPS 下每帧间隔约 33ms。若缓冲区中积压了旧帧，连续 grab 耗时通常极短（< 10ms）。
-        // 只要耗时极短且能抓取成功，说明读的是内存历史缓存，我们快速循环 grab 丢弃，
-        // 直到某一次 grab 产生真实网络等待（> 15ms）或已跳过 8 帧，确保 retrieve 的必定是摄像机传感器刚刚产生的最新物理帧！
-        int skipped = 0;
-        while (skipped < 8 && m_rtspRunning.load() && sessionId == m_rtspSessionId.load()) {
-            const auto tCheckStart = std::chrono::steady_clock::now();
-            if (!cap.grab()) break;
-            const auto dtMs = std::chrono::duration_cast<std::chrono::milliseconds>(
-                std::chrono::steady_clock::now() - tCheckStart).count();
-            skipped++;
-            if (dtMs > 15) {
-                // 等待了网络数据，说明已经抓到了当前时刻最新产生的实时帧！
-                break;
-            }
         }
 
         if (!cap.retrieve(frame) || frame.empty()) {
@@ -296,6 +246,22 @@ void CameraManager::rtspWorkerLoop(const QString &url, quint64 sessionId)
         if (sessionId != m_rtspSessionId.load()) break;
 
         m_lastFrameTime.store(QDateTime::currentMSecsSinceEpoch());
+        const auto decodedAt = std::chrono::steady_clock::now();
+        if (firstFrame) {
+            firstFrame = false;
+            statsStart = decodedAt;
+            qDebug() << "[CameraManager] first_decoded_ms="
+                     << std::chrono::duration_cast<std::chrono::milliseconds>(decodedAt - streamStart).count()
+                     << "size=" << frame.cols << frame.rows;
+        } else {
+            ++decodedFrames;
+            const double seconds = std::chrono::duration<double>(decodedAt - statsStart).count();
+            if (seconds >= 5.0) {
+                qDebug() << "[CameraManager] decoded_fps=" << decodedFrames / seconds;
+                decodedFrames = 0;
+                statsStart = decodedAt;
+            }
+        }
 
         // Luckfox 必须直接输出原生 1280x720。这里拒绝其他尺寸，避免把低分辨率放大
         // 或把高分辨率缩小后误认为设备端已经满足 720p 传输要求。
@@ -385,7 +351,7 @@ void CameraManager::openCamera(const QString &cameraId)
             safeDeleteCamera();
             QCamera *camera = new QCamera(selectedCamera, this);
 
-            // 720P 极速零延迟配置：遍历相机格式，精准锁定 1280x720 最高帧率模式
+            // 720P 极速低延迟配置：遍历相机格式，精准锁定 1280x720 最高帧率模式
             const auto formats = selectedCamera.videoFormats();
             QCameraFormat bestFormat;
             int bestScore = -1;
@@ -415,7 +381,7 @@ void CameraManager::openCamera(const QString &cameraId)
             }
             if (!bestFormat.isNull()) {
                 camera->setCameraFormat(bestFormat);
-                qDebug() << "[CameraManager] USB 相机已锁定 720P 零延迟格式:"
+                qDebug() << "[CameraManager] USB 相机已锁定 720P 低延迟格式:"
                          << bestFormat.resolution() << "@" << bestFormat.maxFrameRate() << "FPS"
                          << bestFormat.pixelFormat();
             }

@@ -178,7 +178,7 @@ MainWindow::MainWindow(QWidget *parent)
     ui->comboBox_3->addItem(QStringLiteral("【网线直连】Luckfox 原生720P@30主码流 (192.168.8.93)"),
                             QStringLiteral("rtsp://192.168.8.93/live/0"));
 
-    // USB 直连模式（172.32.0.93，720P 极速零延迟）
+    // USB 直连模式（172.32.0.93，720P 极速低延迟）
     ui->comboBox_3->addItem(QStringLiteral("【USB直连】Luckfox 原生720P@30主码流 (172.32.0.93)"),
                             QStringLiteral("rtsp://172.32.0.93/live/0"));
     ui->comboBox_3->addItem(QStringLiteral("【USB直连】Luckfox备用子码流 (当前实测704×576@30，不满足720P)"),
@@ -253,6 +253,11 @@ MainWindow::MainWindow(QWidget *parent)
                 ui->plainTextEdit_2->appendPlainText(QStringLiteral("【图像通道】RTSP 视频流已连接"));
             }
         } else if (state == CameraManager::CameraState::Opening) {
+            m_lastFpsCalcTime = 0;
+            m_fpsFrameCount = 0;
+            m_displayedFps = 0;
+            m_lastFpsLogTime = 0;
+            m_lastDisplayFrameTime = 0;
             ui->pushButton_9->setText(QStringLiteral("正在打开..."));
             ui->pushButton_9->setEnabled(false);
         } else if (state == CameraManager::CameraState::Closing) {
@@ -530,7 +535,7 @@ void MainWindow::onCameraChanged(int index)
         m_lastFrame.release();
 
         if (camId.contains("172.32.0.93")) {
-            ui->plainTextEdit_2->appendPlainText(QStringLiteral("【摄像头】切换 -> USB 直连模式（720P 零延迟极速引擎）"));
+            ui->plainTextEdit_2->appendPlainText(QStringLiteral("【摄像头】切换 -> USB 直连模式（720P 低延迟极速引擎）"));
         } else if (camId.startsWith("rtsp://", Qt::CaseInsensitive)) {
             ui->plainTextEdit_2->appendPlainText(QStringLiteral("【摄像头】切换 -> RTSP 网络视频流模式（720P低延迟）"));
         } else {
@@ -577,11 +582,11 @@ void MainWindow::on_pushButton_9_clicked()
         }
 
         if (camId.contains("172.32.0.93")) {
-            ui->plainTextEdit_2->appendPlainText(QStringLiteral("【摄像头】识别为 USB 直连模式，启用 720P 零延迟极速引擎"));
+            ui->plainTextEdit_2->appendPlainText(QStringLiteral("【摄像头】识别为 USB 直连模式，启用 720P 低延迟极速引擎"));
         } else if (camId.startsWith("rtsp://", Qt::CaseInsensitive)) {
             ui->plainTextEdit_2->appendPlainText(QStringLiteral("【摄像头】识别为 RTSP 网络视频流，启用低缓冲取流"));
         } else {
-            ui->plainTextEdit_2->appendPlainText(QStringLiteral("【摄像头】启用本地物理摄像头（锁定 720P 零延迟模式）"));
+            ui->plainTextEdit_2->appendPlainText(QStringLiteral("【摄像头】启用本地物理摄像头（锁定 720P 低延迟模式）"));
         }
 
         m_cameraManager.openCamera(camId);
@@ -752,9 +757,11 @@ void MainWindow::processLatestVideoFrame()
 
     if (m_cameraManager.state() != CameraManager::CameraState::Open || cvMat.empty()) return;
 
-    // 输入端可能高于 30 FPS。只处理最新帧，避免 UI 队列里积累旧画面（允许 50FPS 宽松上限，避免 30FPS 抖动误丢）
+    // RTSP 已在后台合并为最新帧；无线到包有抖动，不能再按 20ms 间隔丢帧。
+    // 本地摄像头保留上限，避免高帧率设备占满 GUI。
     const qint64 frameNow = QDateTime::currentMSecsSinceEpoch();
-    if (m_lastDisplayFrameTime > 0 && frameNow - m_lastDisplayFrameTime < 20) {
+    if (!m_cameraManager.currentCameraId().startsWith(QStringLiteral("rtsp://"), Qt::CaseInsensitive) &&
+        m_lastDisplayFrameTime > 0 && frameNow - m_lastDisplayFrameTime < 20) {
         return;
     }
     m_lastDisplayFrameTime = frameNow;
@@ -865,9 +872,13 @@ void MainWindow::processLatestVideoFrame()
             }
             ++m_fpsFrameCount;
             if (now - m_lastFpsCalcTime >= 1000) {
-                m_displayedFps = m_fpsFrameCount;
+                m_displayedFps = qRound(m_fpsFrameCount * 1000.0 / (now - m_lastFpsCalcTime));
                 m_fpsFrameCount = 0;
                 m_lastFpsCalcTime = now;
+                if (now - m_lastFpsLogTime >= 5000) {
+                    qDebug() << "[Video] displayed_fps=" << m_displayedFps;
+                    m_lastFpsLogTime = now;
+                }
             }
 
             QFont fpsFont = painter.font();

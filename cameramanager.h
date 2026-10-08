@@ -14,6 +14,7 @@
 #include <thread>
 #include <memory>
 #include <mutex>
+#include <vector>
 #include <opencv2/core.hpp>
 
 Q_DECLARE_METATYPE(cv::Mat)
@@ -147,6 +148,7 @@ private:
     std::atomic<bool> m_rtspFormatErrorReported{false}; ///< 是否已报告 RTSP 原生规格不匹配
     std::atomic<int> m_rotationMode{0};     ///< 画面旋转/翻转模式（0: 正常, 1: 180°, 2: 水平, 3: 垂直, 4: 90°, 5: 270°）
     std::unique_ptr<std::thread> m_rtspThread; ///< RTSP 后台解码线程
+    std::vector<std::thread> m_retiredRtspThreads; ///< 取消的线程在销毁对象前统一等待结束
 
     std::mutex m_rtspMatMutex;              ///< RTSP 帧高速保护锁
     cv::Mat m_latestRtspMat;                ///< 最新的 RTSP 画面帧

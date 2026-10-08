@@ -6,12 +6,13 @@
 #include <QNetworkInterface>
 #include <QSettings>
 #include <QUuid>
+#include <QDebug>
 
 namespace { constexpr quint16 kDiscoveryPort = 39093; }
 
 LuckfoxDiscovery::LuckfoxDiscovery(QObject *parent) : QObject(parent)
 {
-    m_retry.setInterval(1000);
+    m_retry.setInterval(250);
     m_deadline.setSingleShot(true);
     connect(&m_socket, &QUdpSocket::readyRead, this, &LuckfoxDiscovery::receive);
     connect(&m_retry, &QTimer::timeout, this, &LuckfoxDiscovery::probe);
@@ -24,6 +25,7 @@ LuckfoxDiscovery::LuckfoxDiscovery(QObject *parent) : QObject(parent)
 void LuckfoxDiscovery::start()
 {
     cancel();
+    m_elapsed.start();
     if (!m_socket.bind(QHostAddress::AnyIPv4, 0)) {
         emit failed(QStringLiteral("无法启动设备查找：%1").arg(m_socket.errorString()));
         return;
@@ -75,7 +77,8 @@ void LuckfoxDiscovery::probe()
     if (m_cachedAddress.protocol() == QAbstractSocket::IPv4Protocol &&
         m_subnets.contains(m_cachedAddress.toIPv4Address() & 0xffffff00U))
         m_socket.writeDatagram(m_request, m_cachedAddress, kDiscoveryPort);
-    if (++m_attempt == 2 || m_attempt == 4) {
+    // 缓存和广播先尝试 250ms；热点隔离广播时及时进行有限单播扫描。
+    if (++m_attempt == 2 || m_attempt == 6) {
         for (quint32 subnet : m_subnets)
             for (quint32 host = 1; host < 255; ++host)
                 m_socket.writeDatagram(m_request, QHostAddress(subnet | host), kDiscoveryPort);
@@ -100,6 +103,7 @@ void LuckfoxDiscovery::receive()
         QSettings settings(QStringLiteral("LuckfoxTracker"), QStringLiteral("Camera"));
         settings.setValue(QStringLiteral("lastAddress"), address);
         settings.setValue(QStringLiteral("deviceId"), id);
+        qDebug() << "[Discovery] found_ms=" << m_elapsed.elapsed();
         cancel();
         emit found(QStringLiteral("rtsp://%1/live/0").arg(address));
         return;

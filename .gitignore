@@ -35,3 +35,6 @@ runs/
 /.codex-tmp/
 __pycache__/
 *.pyc
+
+# Wireless control HMAC key (never commit)
+luckfox-control.key

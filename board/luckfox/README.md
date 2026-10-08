@@ -14,6 +14,7 @@
 | S99zzzcontrol | /etc/init.d/S99zzzcontrol |
 
 两个启动脚本需要可执行权限。发现服务使用板子现有的Python 3和UDP 39093；Qt收到回应后连接回应源地址的RTSP `/live/0`。
+发现服务可选读取 `/userdata/cfg/luckfox-control.json` 的 `auth_key`、`bind_address`、`device_id`；文件不存在时不签名并照常运行。
 Wi-Fi脚本读取板子已有的 `/userdata/cfg/wpa_supplicant.conf`；仓库不保存热点密码。
 有线管理地址为192.168.8.93/24，无线地址由热点DHCP分配。开机约一分钟完成无线初始化。
 
@@ -51,4 +52,8 @@ Wi-Fi脚本读取板子已有的 `/userdata/cfg/wpa_supplicant.conf`；仓库不
 目前已确认 STM32 遥测、指令 ACK 和模式切换；用户尚未接入云台，运动闭环仍待验收。
 部署与当前 UART 启用限制见根目录 [无线控制说明](../../WIRELESS_CONTROL.md)。
 `/userdata/cfg/luckfox-control.json` 必须使用确认后的实际 UART；配置缺失时不启动服务。
-网络命令按请求编号去重，UART 非幂等命令不盲目重发；断网时停止控制并停止 UART 心跳。
+网络命令按请求编号去重，UART 非幂等命令不盲目重发；UART ACK 超时只报告失败、保留会话。
+断网或 bye 时只发送停止跟踪（0x12）并停止 UART 心跳，不主动回中，由 STM32 链路超时在自动模式回中。
+两个服务由启动脚本的 `supervise` 外壳守护，异常退出后自动重启；UART 读写错误会关闭并退避重开。
+`auth_key` 配置后控制和发现消息使用 HMAC-SHA256 签名，样例配置中为空（不认证）；配置与密钥分发见
+[无线控制说明](../../WIRELESS_CONTROL.md) 的“消息认证配置”，真实密钥不得提交。

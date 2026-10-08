@@ -37,6 +37,48 @@ STM32 → UART 角度/模式/ACK → Luckfox → UDP 5005 → 电脑 Qt。
 配置不存在时，启动脚本明确报告未配置并不启动服务。
 Qt 可以先使用视频，控制服务不可用时会继续握手并显示云台离线。
 
+可选配置项：
+
+| 字段 | 默认 | 说明 |
+| --- | --- | --- |
+| `bind_address` | `0.0.0.0` | 控制（UDP 5005）与发现（UDP 39093）监听地址。绑定具体地址后发现服务收不到广播，Qt 会退回本网段单播查找 |
+| `auth_key` | 空 | HMAC-SHA256 密钥，十六进制、至少 32 个字符；空表示不认证（启动日志会警告） |
+| `device_id` | 网卡 MAC | 仅发现服务使用；默认取 eth0 MAC，eth0 不存在时退回 wlan0 或其他网卡 |
+
+### 守护与自恢复
+
+`S99zzzcontrol`、`S99zzzdiscovery` 启动的是 `脚本 supervise` 守护外壳，PID 文件记录外壳 PID，
+子进程 PID 记录在 `*.child.pid`；状态检查会核对 `/proc/<pid>/cmdline`，避免 PID 复用误判。
+Python 进程退出后外壳 2s 重启；配置无效时 Python 以退出码 2 结束，外壳不再重启并保留日志。
+`stop` 先结束外壳（外壳转发 TERM 给子进程），再确认子进程退出。
+Python 内部：UDP 收发的 OSError 只记录日志（同类错误 30s 内只记一次，避免写满内存盘 /tmp）；
+UART 读写出错时关闭串口，按 0.5s 起、最长 5s 的退避重开，期间等待中的命令按 ACK 超时报告失败；
+其他未预料异常由进程内监督循环记录堆栈，按 1s 起、最长 30s 退避后重建服务。
+
+### 控制策略（2026-10 调整）
+
+- UART ACK 450ms 超时：只向电脑报告 `command_failed`，保留会话，不停止跟踪、不回中。
+- 会话超时或 bye：只发送 CMD 0x12 停止跟踪并停止 UART 心跳，不发送 0x02 回中；
+  STM32 1s 链路超时后仅在自动模式回中，手动模式保持角度。
+- 目标坐标每个新序号只转发一次（最短间隔 20ms，间隔内只发最新值），不重复发送同一坐标。
+- 状态消息增加 `flags`（故障/急停/链路丢失），详见 `PROTOCOL.md`。
+
+### 消息认证配置
+
+配置密钥后，控制与发现消息使用 HMAC-SHA256 签名，详见 `PROTOCOL.md`“认证封装”。步骤：
+
+1. 在电脑上生成密钥：`python -c "import secrets;print(secrets.token_hex(32))"`。
+2. 板端：编辑 `/userdata/cfg/luckfox-control.json`，把密钥填入 `auth_key`，然后
+   `/etc/init.d/S99zzzcontrol restart`、`/etc/init.d/S99zzzdiscovery stop && /etc/init.d/S99zzzdiscovery start`。
+   注意文件权限（建议 `chmod 600`），不要把含真实密钥的配置提交到仓库或贴进报告。
+3. 电脑端：把同一密钥写入 `untitled7.exe` 所在目录的 `luckfox-control.key`（单行十六进制），
+   或设置环境变量 `LUCKFOX_CONTROL_KEY`（优先于文件）。该文件已加入 `.gitignore`。
+4. 两端必须同时启用或同时停用。只有一端有密钥时，控制会话无法建立、发现也会失败；
+   电脑端密钥格式错误时直接报告错误，不会退回明文。
+
+限制：签名只保证来源和完整性，不加密；板端重启后旧会话记录清空，重启前截获的报文理论上可被重放；
+发现请求本身未签名，任何人都能得到设备的 device_id。
+
 ### 当前接线与 UART2 配置
 
 | Luckfox Pico Plus 引脚 | UART2_M1 功能 | STM32 接口 |

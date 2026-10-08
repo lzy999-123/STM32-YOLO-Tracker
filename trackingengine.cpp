@@ -139,9 +139,31 @@ cv::Rect TrackingEngine::boundedIntRect(const cv::Rect2d &rect, const cv::Size &
     return boundedRect(rect, size);
 }
 
+void TrackingEngine::onDnnTrackedResult(
+    const cv::Rect2d &dnnRect, bool success, const QString &className, quint64 sessionId)
+{
+    std::lock_guard<std::recursive_mutex> stateLock(m_stateMutex);
+    // DnnThread 解锁后才发信号，期间可能已经 stop/start 了新会话；
+    // 这里在状态锁内再按会话 ID 校验，旧会话的 LOCK/跟踪结果一律丢弃。
+    if (sessionId == 0 || sessionId != m_dnnSessionId || m_useFeatureTracking) return;
+    onDnnResultReceived(dnnRect, success, className);
+}
+
 void TrackingEngine::onDnnResultReceived(const cv::Rect2d &dnnRect, bool success, const QString &className) {
     std::lock_guard<std::recursive_mutex> stateLock(m_stateMutex);
     if (!m_isCapturing) return;
+    ++m_resultSeq; // 每个推理/跟踪结果（含未检出）都是一次新结果
+
+    if (className == QStringLiteral("HOLD")) {
+        // YOLO 短暂未检出，DnnThread 沿用上一位置。这不是新的测量：
+        // 保留显示框，但偏移输出 0，避免下位机把旧误差当成当前误差持续转动。
+        if (success && m_isTargetTracked && !m_trackedRect.empty()) {
+            m_offsetX = 0;
+            m_offsetY = 0;
+            return;
+        }
+        success = false;
+    }
 
     QString resultName = className;
     const bool isRecoverResult = resultName.startsWith(QStringLiteral("RECOVER:"));
@@ -241,7 +263,9 @@ void TrackingEngine::onDnnResultReceived(const cv::Rect2d &dnnRect, bool success
             }
         }
         // 如果 lostFrameCount <= MAX_LOST_TOLERANCE，则保持 m_isTargetTracked 为 true，
-        // 且保留 m_trackedRect、m_offsetX、m_offsetY 的上一次值，起到防抖和惯性预测的作用。
+        // 保留 m_trackedRect 用于显示防抖；但偏移置零，旧位置不能当作新测量下发。
+        m_offsetX = 0;
+        m_offsetY = 0;
     }
 
 
@@ -255,6 +279,7 @@ void TrackingEngine::onYoloDetectionResult(
     bool finished)
 {
     std::lock_guard<std::recursive_mutex> stateLock(m_stateMutex);
+    if (!m_isCapturing) return; // 已停止的会话：迟到的检测结果不再处理
     if (m_featureYoloClassifyPending &&
         requestId == m_featureYoloClassifyRequestId &&
         !m_featureYoloClassifyFrame.empty()) {
@@ -449,6 +474,8 @@ void TrackingEngine::onYoloDetectionResult(
 
 void TrackingEngine::restartDnnThread(const QString &modelFileName)
 {
+    m_trackingGeneration.fetch_add(1, std::memory_order_acq_rel);
+    m_dnnSessionId = 0;
     m_isCapturing = false;
     m_isTargetTracked = false;
     m_trackedRect = cv::Rect2d();
@@ -467,6 +494,9 @@ void TrackingEngine::restartDnnThread(const QString &modelFileName)
     } else if (thread && !thread->isNetEmpty()) {
         emit logMessage(
             QStringLiteral("【系统】已切换到模型：%1，正在等待预热完成。").arg(modelFileName));
+    } else if (thread && thread->isModelLoading()) {
+        emit logMessage(
+            QStringLiteral("【系统】已切换到模型：%1，正在后台加载模型并预热。").arg(modelFileName));
     } else {
         emit logMessage(
             QStringLiteral("【警告】YOLO 模型加载失败：%1").arg(modelFileName));
@@ -499,7 +529,13 @@ DnnThread *TrackingEngine::ensureDnnThread(const QString &modelFileName)
     // 在推理线程处理，避免 GUI 等待 CSRT 占用的状态锁或执行外观重捕。
     // DnnThread 必须先释放输入锁再发结果，保持 state -> input 的锁顺序。
     connect(thread, &DnnThread::dnnTrackedResult,
-            this, &TrackingEngine::onDnnResultReceived, Qt::DirectConnection);
+            this, &TrackingEngine::onDnnTrackedResult, Qt::DirectConnection);
+    // 模型在推理线程中异步加载；结果排队回到引擎所在线程再输出日志（主界面据此刷新按钮状态）。
+    connect(thread, &DnnThread::modelLoadFinished, this,
+            [this](bool success, const QString &message) {
+        emit logMessage(
+            QString(success ? "【系统】%1" : "【警告】%1").arg(message));
+    });
     connect(thread, &DnnThread::yoloDetectionResult,
             this, &TrackingEngine::onYoloDetectionResult, Qt::DirectConnection);
     connect(thread, &DnnThread::dnnWarmupFinished, this,
@@ -1110,7 +1146,7 @@ void TrackingEngine::requestFeatureYoloTargetClassification(const cv::Mat &frame
         return;
     }
 
-    if (!m_dnnThread || m_dnnThread->isNetEmpty()) {
+    if (!m_dnnThread || m_dnnThread->isLoadFailed()) {
         m_featureYoloClassKnown = true;
         m_featureUseYoloRecovery = false;
         emit logMessage(
@@ -1118,7 +1154,7 @@ void TrackingEngine::requestFeatureYoloTargetClassification(const cv::Mat &frame
         return;
     }
 
-    if (!m_dnnThread->isWarmedUp()) {
+    if (m_dnnThread->isNetEmpty() || !m_dnnThread->isWarmedUp()) {
         m_featureUseYoloRecovery = false;
         emit logMessage(
             QStringLiteral("【系统】YOLO 辅助正在预热，框选目标暂未完成类别判断；开始跟踪或预热完成后会重试，当前先按传统特征重捕。"));
@@ -1126,6 +1162,7 @@ void TrackingEngine::requestFeatureYoloTargetClassification(const cv::Mat &frame
     }
 
     m_featureYoloClassifyPending = true;
+    m_featureYoloClassifyRequestTime = QDateTime::currentMSecsSinceEpoch();
     m_featureYoloClassifyRequestId = nextFeatureYoloRequestId();
     m_featureYoloClassifyFrame = frame.clone();
     m_dnnThread->requestDetections(m_featureYoloClassifyFrame, m_featureYoloClassifyRequestId);
@@ -1139,7 +1176,10 @@ void TrackingEngine::requestFeatureYoloRecovery(const cv::Mat &frame)
         !m_dnnThread ||
         m_dnnThread->isNetEmpty() ||
         !m_dnnThread->isWarmedUp() ||
-        m_featureYoloRecoveryPending) {
+        m_featureYoloRecoveryPending ||
+        m_featureYoloClassifyPending) {
+        // DnnThread 只保留一个待处理检测请求；类别判定未完成时发重捕请求会覆盖它，
+        // 使判定永远收不到 finished 结果。因此判定期间不发重捕请求。
         return;
     }
 
@@ -1183,9 +1223,23 @@ void TrackingEngine::resetFeatureRecoveryCandidate()
     m_featureYoloCandidatesEvaluated = 0;
 }
 
+void TrackingEngine::expireStaleFeatureYoloClassification()
+{
+    if (!m_featureYoloClassifyPending) return;
+    const qint64 now = QDateTime::currentMSecsSinceEpoch();
+    if (now - m_featureYoloClassifyRequestTime < kFeatureYoloClassifyTimeoutMs) return;
+    m_featureYoloClassifyPending = false;
+    m_featureYoloClassifyFrame.release();
+    m_featureYoloClassKnown = true;
+    m_featureUseYoloRecovery = false;
+    emit logMessage(
+        QStringLiteral("【系统】YOLO 类别判定超时，重捕策略改为 ORB/模板/颜色传统特征重捕。"));
+}
+
 void TrackingEngine::resetFeatureYoloTargetClassification()
 {
     m_featureYoloClassifyPending = false;
+    m_featureYoloClassifyRequestTime = 0;
     m_featureYoloClassifyFrame.release();
     m_featureYoloClassKnown = false;
     m_featureUseYoloRecovery = false;
@@ -1502,7 +1556,14 @@ void TrackingEngine::setCurrentModel(const QString &modelFileName)
 bool TrackingEngine::yoloReady() const
 {
     std::lock_guard<std::recursive_mutex> stateLock(m_stateMutex);
-    return m_dnnThread && !m_dnnThread->isNetEmpty();
+    // 仍在后台加载时不算失败；是否可开始跟踪由 yoloWarmedUp() 决定。
+    return m_dnnThread && !m_dnnThread->isLoadFailed();
+}
+
+bool TrackingEngine::yoloLoading() const
+{
+    std::lock_guard<std::recursive_mutex> stateLock(m_stateMutex);
+    return m_dnnThread && m_dnnThread->isModelLoading();
 }
 
 bool TrackingEngine::yoloWarmedUp() const
@@ -1519,20 +1580,28 @@ void TrackingEngine::setTrackingBackend(bool useFeatureTracking, const QString &
 
 void TrackingEngine::startTracking(const cv::Mat &frame, const cv::Rect2d &targetRect, bool useFeatureTracking, const QString &modelFileName) {
     std::lock_guard<std::recursive_mutex> stateLock(m_stateMutex);
+    // 新会话：此前排队尚未送达的 targetTracked/targetLost 都属于旧会话。
+    m_trackingGeneration.fetch_add(1, std::memory_order_acq_rel);
+    m_dnnSessionId = 0;
     m_useFeatureTracking = useFeatureTracking;
     m_currentModelName = modelFileName;
     m_selectedRect = targetRect;
     resetFeatureYoloTargetClassification();
-    
+
     if (!m_useFeatureTracking && (!m_dnnThread || m_dnnThread->isNetEmpty())) {
-        emit logMessage("❌【错误】YOLO 模型加载失败或未准备好！");
+        emit logMessage(m_dnnThread && m_dnnThread->isModelLoading()
+                            ? QStringLiteral("【提示】YOLO 模型仍在后台加载，请稍候再开始跟踪。")
+                            : QStringLiteral("❌【错误】YOLO 模型加载失败或未准备好！"));
         return;
     }
-    
+
     m_isCapturing = true;
     m_lostFrameCount = 0;
     m_isTargetTracked = false;
-    
+    m_trackedRect = cv::Rect2d();
+    m_offsetX = 0;
+    m_offsetY = 0;
+
     if (m_useFeatureTracking) {
         requestFeatureYoloTargetClassification(frame);
         if (!initFeatureTracker(frame, m_selectedRect)) {
@@ -1542,28 +1611,38 @@ void TrackingEngine::startTracking(const cv::Mat &frame, const cv::Rect2d &targe
         m_isTargetTracked = true;
     } else {
         resetFeatureTracker();
-        m_dnnThread->initDnn(frame, m_selectedRect);
+        m_dnnSessionId = m_dnnThread->initDnn(frame, m_selectedRect);
+        if (m_dnnSessionId == 0) {
+            m_isCapturing = false;
+        }
     }
 }
 
 void TrackingEngine::stopTracking() {
     std::lock_guard<std::recursive_mutex> stateLock(m_stateMutex);
+    const quint64 generation =
+        m_trackingGeneration.fetch_add(1, std::memory_order_acq_rel) + 1;
+    m_dnnSessionId = 0;
     m_isCapturing = false;
     m_lostFrameCount = 0;
     if (m_dnnThread) m_dnnThread->stopDnn();
     resetFeatureTracker();
+    resetFeatureYoloTargetClassification();
     m_trackedRect = cv::Rect2d();
     m_isTargetTracked = false;
     m_offsetX = 0;
     m_offsetY = 0;
-    emit targetLost();
+    emit targetLost(generation);
 }
 
 void TrackingEngine::processFrame(const cv::Mat &frame) {
     std::lock_guard<std::recursive_mutex> stateLock(m_stateMutex);
     if (!m_isCapturing) return;
-    
+    const quint64 generation = m_trackingGeneration.load(std::memory_order_acquire);
+
     if (m_useFeatureTracking) {
+        expireStaleFeatureYoloClassification();
+        ++m_resultSeq; // CSRT 每处理一帧都产生一个新结果
         if (!updateFeatureTracker(frame)) {
             // updateFeatureTracker 已经负责发起一次重捕；这里不要再次重捕，
             // 否则同一帧会重复执行整幅搜索。
@@ -1576,7 +1655,7 @@ void TrackingEngine::processFrame(const cv::Mat &frame) {
                     emit logMessage("【警告】目标丢失！已清除追踪框，正在尝试找回...");
                 }
                 m_trackedRect = cv::Rect2d();
-                emit targetLost();
+                emit targetLost(generation);
             }
         } else {
             m_isTargetTracked = true;
@@ -1596,9 +1675,12 @@ void TrackingEngine::processFrame(const cv::Mat &frame) {
             if (abs(offset_x) < DEAD_ZONE) offset_x = 0;
             if (abs(offset_y) < DEAD_ZONE) offset_y = 0;
 
-            m_offsetX = offset_x;
-            m_offsetY = offset_y;
-            emit targetTracked(m_trackedRect, m_offsetX, m_offsetY);
+            // 外观校验未通过时 updateFeatureTracker 沿用上一可靠框（m_featureUnreliableCount > 0），
+            // 这不是新测量，偏移输出 0。
+            const bool heldResult = m_featureUnreliableCount > 0;
+            m_offsetX = heldResult ? 0 : offset_x;
+            m_offsetY = heldResult ? 0 : offset_y;
+            emit targetTracked(m_trackedRect, m_offsetX, m_offsetY, generation, m_resultSeq);
         }
     } else {
         // YOLO logic is handled by dnnThread async, it calls onDnnResultReceived
@@ -1606,10 +1688,12 @@ void TrackingEngine::processFrame(const cv::Mat &frame) {
         if (m_dnnThread && m_dnnThread->isWarmedUp()) {
             m_dnnThread->updateDnn(frame);
         }
+        // 每个视频帧都会发信号用于界面显示；resultSeq 只在 DNN 返回新结果时变化，
+        // 接收方据此只下发新结果，不会对同一结果按视频帧重复发送。
         if (m_isTargetTracked && m_trackedRect.width > 0) {
-             emit targetTracked(m_trackedRect, m_offsetX, m_offsetY);
+             emit targetTracked(m_trackedRect, m_offsetX, m_offsetY, generation, m_resultSeq);
         } else if (!m_isTargetTracked) {
-             emit targetLost();
+             emit targetLost(generation);
         }
     }
 }

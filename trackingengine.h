@@ -6,6 +6,7 @@
 #include <QSize>
 #include <QHash>
 #include <QString>
+#include <atomic>
 #include <mutex>
 #include <opencv2/opencv.hpp>
 #include <opencv2/tracking.hpp>
@@ -73,6 +74,15 @@ public:
     /// @brief 检查 YOLO 模型是否预热完毕
     bool yoloWarmedUp() const;
 
+    /// @brief YOLO 模型是否仍在后台加载
+    bool yoloLoading() const;
+
+    /**
+     * @brief 当前跟踪会话代号。startTracking/stopTracking 都会递增；
+     * 接收方应丢弃 generation 与此值不一致的 targetTracked/targetLost（旧会话残留的排队信号）。
+     */
+    quint64 trackingGeneration() const { return m_trackingGeneration.load(std::memory_order_acquire); }
+
     /// @brief 是否正在执行追踪任务
     bool isTracking() const;
     
@@ -93,18 +103,23 @@ signals:
      * @brief 追踪成功信号，向主界面和串口控制器发送目标位置
      * @param rect 当前目标的坐标与尺寸
      * @param offsetX X轴偏差
-     * @param offsetY Y轴偏差
+     * @param offsetY Y轴偏差（目标仅为沿用的旧位置时为 0，不是新测量）
+     * @param generation 发出信号时的跟踪会话代号
+     * @param resultSeq 跟踪/推理结果序号；只有序号变化才代表有新结果，需要下发
      */
-    void targetTracked(const cv::Rect2d &rect, int offsetX, int offsetY);
+    void targetTracked(const cv::Rect2d &rect, int offsetX, int offsetY, quint64 generation, quint64 resultSeq);
     
     /// @brief 目标丢失信号
-    void targetLost();
+    void targetLost(quint64 generation);
     
     /// @brief 输出系统日志信号（例如恢复策略的判定过程）
     void logMessage(const QString &msg);
 
 private slots:
-    /// @brief 接收来自 DNN 线程的持续追踪结果
+    /// @brief 接收来自 DNN 线程的持续追踪结果（按 sessionId 丢弃旧会话结果）
+    void onDnnTrackedResult(const cv::Rect2d &dnnRect, bool success, const QString &className, quint64 sessionId);
+
+    /// @brief 处理一次追踪结果（YOLO 或特征跟踪内部调用）
     void onDnnResultReceived(const cv::Rect2d &dnnRect, bool success, const QString &className = "");
     
     /// @brief 接收 YOLO 全局检测结果，用于目标丢失时的找回
@@ -198,6 +213,9 @@ private:
     
     /// @brief 重置类别判定状态
     void resetFeatureYoloTargetClassification();
+
+    /// @brief 类别判定请求超时（结果丢失）时复位等待状态，避免永久卡住
+    void expireStaleFeatureYoloClassification();
     
     /// @brief 传统恢复算法：ORB 特征点匹配找回
     bool recoverFeatureTrackerByOrb(const cv::Mat &frame, cv::Rect &recoveredRect) const;
@@ -224,6 +242,9 @@ private:
     int m_offsetX = 0;                    ///< 当前 X 轴偏移量
     int m_offsetY = 0;                    ///< 当前 Y 轴偏移量
     int m_lostFrameCount = 0;             ///< 连续丢失帧数计数
+    std::atomic<quint64> m_trackingGeneration{0}; ///< 跟踪会话代号（start/stop 递增）
+    quint64 m_dnnSessionId = 0;           ///< 当前 YOLO 跟踪会话 ID（DnnThread::initDnn 返回）
+    quint64 m_resultSeq = 0;              ///< 每产生一次新的跟踪/推理结果递增
 
     DnnThread *m_dnnThread = nullptr;     ///< 当前指向的 DNN 线程
     QHash<QString, DnnThread*> m_dnnThreads; ///< 保存预热模型的字典列表
@@ -257,6 +278,7 @@ private:
     // YOLO 目标定性分类模块成员变量
     bool m_featureYoloClassifyPending = false;
     quint64 m_featureYoloClassifyRequestId = 0;
+    qint64 m_featureYoloClassifyRequestTime = 0; ///< 类别判定请求发出时间，用于超时复位
     cv::Mat m_featureYoloClassifyFrame;
     double m_featureYoloClassifyBestScore = 0.0;
     int m_featureYoloClassifyBestClassId = -1;
@@ -284,6 +306,7 @@ private:
     static constexpr double kFeatureYoloClassifyMinSelectedCoverage = 0.35;
     static constexpr double kFeatureYoloClassifyMinCandidateCoverage = 0.22;
     static constexpr double kFeatureYoloClassifyMinSizeSimilarity = 0.18;
+    static constexpr qint64 kFeatureYoloClassifyTimeoutMs = 3000; ///< 类别判定等待上限
     static constexpr int DEAD_ZONE = 18; ///< 偏移死区（在此像素范围内不进行云台微调）
 
     /// @brief 针对特定类别获取适配的置信度阈值

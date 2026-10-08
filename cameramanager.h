@@ -133,8 +133,18 @@ private:
     /// @brief 停止 RTSP 网络流拉流
     void stopRtspStream();
 
-    /// @brief RTSP 后台取流线程主循环
-    void rtspWorkerLoop(const QString &url, quint64 sessionId);
+    /// @brief RTSP 后台取流线程主循环；退出时把 finished 置为 true
+    void rtspWorkerLoop(const QString &url, quint64 sessionId,
+                        std::shared_ptr<std::atomic<bool>> finished);
+
+    /// @brief 回收已经退出的取消线程（非阻塞，只 join 已结束的线程）
+    void reapRetiredRtspThreads();
+
+    /// @brief 已取消、等待回收的 RTSP 线程
+    struct RetiredRtspThread {
+        std::thread thread;
+        std::shared_ptr<std::atomic<bool>> finished;
+    };
 
     QCamera *m_camera;                      ///< 摄像头设备对象
     QMediaCaptureSession *m_captureSession; ///< 媒体捕获会话，用于连接设备与输出
@@ -151,7 +161,8 @@ private:
     std::atomic<bool> m_rtspFormatErrorReported{false}; ///< 是否已报告 RTSP 原生规格不匹配
     std::atomic<int> m_rotationMode{0};     ///< 画面旋转/翻转模式（0: 正常, 1: 180°, 2: 水平, 3: 垂直, 4: 90°, 5: 270°）
     std::unique_ptr<std::thread> m_rtspThread; ///< RTSP 后台解码线程
-    std::vector<std::thread> m_retiredRtspThreads; ///< 取消的线程在销毁对象前统一等待结束
+    std::shared_ptr<std::atomic<bool>> m_rtspThreadFinished; ///< 当前 RTSP 线程是否已退出
+    std::vector<RetiredRtspThread> m_retiredRtspThreads; ///< 取消的线程：结束后定期回收，析构时等待剩余线程
 
     std::mutex m_rtspMatMutex;              ///< RTSP 帧高速保护锁
     cv::Mat m_latestRtspMat;                ///< 最新的 RTSP 画面帧

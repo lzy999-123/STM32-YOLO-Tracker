@@ -1,8 +1,84 @@
 #include "networkcontroller.h"
+#include <QCoreApplication>
+#include <QCryptographicHash>
+#include <QDir>
+#include <QFile>
 #include <QJsonDocument>
+#include <QMessageAuthenticationCode>
 #include <QNetworkDatagram>
 #include <QUuid>
+#include <cctype>
 #include <cmath>
+
+namespace {
+QByteArray authCode(const QByteArray &inner, const QByteArray &key)
+{
+    return QMessageAuthenticationCode::hash(inner, key, QCryptographicHash::Sha256).toHex();
+}
+}
+
+QByteArray NetworkController::parseAuthKey(const QByteArray &hex, QString *error)
+{
+    const QByteArray text = hex.trimmed();
+    bool valid = text.size() >= 32 && text.size() % 2 == 0;
+    for (char c : text) valid = valid && std::isxdigit(static_cast<unsigned char>(c));
+    if (!valid) {
+        if (error) *error = QStringLiteral("无线控制密钥格式无效：需要至少 32 个十六进制字符");
+        return {};
+    }
+    return QByteArray::fromHex(text);
+}
+
+QByteArray NetworkController::loadAuthKey(QString *error)
+{
+    if (error) error->clear();
+    if (qEnvironmentVariableIsSet("LUCKFOX_CONTROL_KEY"))
+        return parseAuthKey(qgetenv("LUCKFOX_CONTROL_KEY"), error);
+    if (!QCoreApplication::instance()) return {};
+    QFile file(QDir(QCoreApplication::applicationDirPath()).filePath(QStringLiteral("luckfox-control.key")));
+    if (!file.exists()) return {};
+    if (!file.open(QIODevice::ReadOnly)) {
+        if (error) *error = QStringLiteral("无法读取无线控制密钥文件：%1").arg(file.errorString());
+        return {};
+    }
+    return parseAuthKey(file.read(4096), error);
+}
+
+QByteArray NetworkController::sealMessage(const QByteArray &inner, const QByteArray &key)
+{
+    if (key.isEmpty()) return inner;
+    return QJsonDocument(QJsonObject{{"m", QString::fromUtf8(inner)},
+                                     {"auth", QString::fromLatin1(authCode(inner, key))}})
+        .toJson(QJsonDocument::Compact);
+}
+
+bool NetworkController::openMessage(const QByteArray &datagram, const QByteArray &key, QByteArray *inner)
+{
+    if (key.isEmpty()) {
+        *inner = datagram;
+        return true;
+    }
+    const auto envelope = QJsonDocument::fromJson(datagram).object();
+    const auto message = envelope.value("m");
+    const auto auth = envelope.value("auth");
+    if (envelope.size() != 2 || !message.isString() || !auth.isString()) return false;
+    const QByteArray text = message.toString().toUtf8();
+    const QByteArray expected = authCode(text, key);
+    const QByteArray received = auth.toString().toLatin1();
+    if (received.size() != expected.size()) return false;
+    // 常数时间比较，避免按字节提前返回泄露签名前缀。
+    char diff = 0;
+    for (qsizetype i = 0; i < expected.size(); ++i) diff |= char(expected[i] ^ received[i]);
+    if (diff != 0) return false;
+    *inner = text;
+    return true;
+}
+
+void NetworkController::setAuthKey(const QByteArray &key)
+{
+    m_authKey = key;
+    m_authError.clear();
+}
 
 NetworkController::NetworkController(QObject *parent) : QObject(parent)
 {
@@ -10,6 +86,7 @@ NetworkController::NetworkController(QObject *parent) : QObject(parent)
     connect(&m_timer, &QTimer::timeout, this, &NetworkController::tick);
     connect(&m_socket, &QUdpSocket::readyRead, this, &NetworkController::receive);
     m_clock.start();
+    m_authKey = loadAuthKey(&m_authError);
 }
 
 void NetworkController::connectToDevice(const QString &address, quint16 port)
@@ -17,6 +94,10 @@ void NetworkController::connectToDevice(const QString &address, quint16 port)
     const QHostAddress host(address);
     if (m_active && host == m_address && port == m_port) return;
     disconnectDevice();
+    if (!m_authError.isEmpty()) {
+        emit connectionLost(m_authError);
+        return;
+    }
     if (host.protocol() != QAbstractSocket::IPv4Protocol || port == 0) {
         emit connectionLost(QStringLiteral("无线控制需要有效的设备 IPv4 地址"));
         return;
@@ -44,7 +125,8 @@ void NetworkController::send(QJsonObject message)
     if (!m_active) return;
     message.insert(QStringLiteral("version"), 1);
     message.insert(QStringLiteral("session"), m_session);
-    m_socket.writeDatagram(QJsonDocument(message).toJson(QJsonDocument::Compact), m_address, m_port);
+    m_socket.writeDatagram(sealMessage(QJsonDocument(message).toJson(QJsonDocument::Compact), m_authKey),
+                           m_address, m_port);
 }
 
 void NetworkController::disconnectDevice()
@@ -57,6 +139,14 @@ void NetworkController::disconnectDevice()
     m_commands.clear();
     m_socket.close();
     setOnline(false);
+    setFlags(0);
+}
+
+void NetworkController::setFlags(int flags)
+{
+    if (m_flags == flags) return;
+    m_flags = flags;
+    emit telemetryFlagsChanged(flags);
 }
 
 void NetworkController::setOnline(bool online)
@@ -71,6 +161,7 @@ void NetworkController::loseConnection(const QString &reason)
     m_connected = false;
     m_remoteOnline = false;
     setOnline(false);
+    setFlags(0);
     while (!m_commands.isEmpty()) emit commandFailed(m_commands.dequeue().cmd);
     // 换会话后不能重放旧命令或旧坐标；需重新收到 STM32 遥测才能操作。
     m_session = QUuid::createUuid().toString(QUuid::WithoutBraces);
@@ -144,7 +235,9 @@ void NetworkController::receive()
     while (m_socket.hasPendingDatagrams()) {
         const auto packet = m_socket.receiveDatagram(1400);
         if (!m_active || packet.senderAddress() != m_address || packet.senderPort() != m_port) continue;
-        const auto reply = QJsonDocument::fromJson(packet.data()).object();
+        QByteArray inner;
+        if (!openMessage(packet.data(), m_authKey, &inner)) continue; // 有密钥时丢弃未签名/伪造数据
+        const auto reply = QJsonDocument::fromJson(inner).object();
         if (reply.value("version").toInt() != 1 || reply.value("session").toString() != m_session) continue;
         const QString type = reply.value("type").toString();
         if (type == QStringLiteral("welcome")) {
@@ -165,12 +258,14 @@ void NetworkController::receive()
             const int mode = reply.value("mode").toInt(-1);
             const double horizontal = reply.value("horizontal").toDouble(NAN);
             const double vertical = reply.value("vertical").toDouble(NAN);
+            const int flags = reply.value("flags").toInt(0); // 旧板端无此字段，视为 0
             if (online && (mode == 0 || mode == 1) && std::isfinite(horizontal) && std::isfinite(vertical)
                 && horizontal >= -3276.8 && horizontal <= 3276.7
                 && vertical >= -3276.8 && vertical <= 3276.7) {
                 m_lastTelemetry = m_clock.elapsed();
                 m_remoteOnline = true;
                 setOnline(true);
+                setFlags(flags >= 0 && flags <= 255 ? flags : 0);
                 emit telemetryReceived(mode, float(horizontal), float(vertical));
             } else {
                 m_remoteOnline = false;

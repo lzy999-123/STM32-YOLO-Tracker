@@ -145,6 +145,36 @@ DnnThread::DnnThread(const QString &modelFileName, QObject *parent)
         "toaster", "sink", "refrigerator", "book", "clock", "vase", "scissors", "teddy bear", "hair drier", "toothbrush"
     };
 
+    // ONNX Runtime 会话创建（尤其是 CUDA Provider）可能耗时数秒，
+    // 改为在 run() 中由推理线程加载，避免阻塞 GUI 线程。
+}
+
+namespace {
+std::atomic<quint64> s_nextDnnSessionId{0};
+
+quint64 nextDnnSessionId()
+{
+    quint64 id = ++s_nextDnnSessionId;
+    if (id == 0) {
+        id = ++s_nextDnnSessionId;
+    }
+    return id;
+}
+}
+
+QString DnnThread::modelFileName() const
+{
+    QMutexLocker locker(&m_mutex);
+    return m_modelFileName;
+}
+
+bool DnnThread::loadModel()
+{
+    QString requestedModel;
+    {
+        QMutexLocker locker(&m_mutex);
+        requestedModel = m_modelFileName;
+    }
     try {
         m_ortEnv = Ort::Env(ORT_LOGGING_LEVEL_WARNING, "YOLO26");
         Ort::SessionOptions sessionOptions;
@@ -159,9 +189,9 @@ DnnThread::DnnThread(const QString &modelFileName, QObject *parent)
         } catch (...) {
             qDebug() << "配置 CUDA 失败，将回退到 CPU!";
         }
-        const QStringList modelCandidates = m_modelFileName.isEmpty()
+        const QStringList modelCandidates = requestedModel.isEmpty()
                                                 ? QStringList{QStringLiteral("yolo26s.onnx"), QStringLiteral("yolo26n.onnx")}
-                                                : QStringList{m_modelFileName};
+                                                : QStringList{requestedModel};
         QStringList modelSearchDirs;
         auto addSearchDir = [&modelSearchDirs](const QString &path) {
             const QString cleanPath = QDir(path).absolutePath();
@@ -201,7 +231,10 @@ DnnThread::DnnThread(const QString &modelFileName, QObject *parent)
                                    .arg(checkedModelPaths.join(", "));
             throw std::runtime_error(m_modelLoadError.toStdString());
         }
-        m_modelFileName = QFileInfo(modelPath).fileName();
+        {
+            QMutexLocker locker(&m_mutex);
+            m_modelFileName = QFileInfo(modelPath).fileName();
+        }
         qDebug() << "正在加载 YOLO 模型:" << modelPath;
         m_ortSession = new Ort::Session(
             m_ortEnv, modelPath.toStdWString().c_str(), sessionOptions);
@@ -228,12 +261,23 @@ DnnThread::DnnThread(const QString &modelFileName, QObject *parent)
         }
         
         qDebug() << "ONNX Runtime 模型加载成功!";
+        return true;
     } catch (const Ort::Exception& e) {
         qDebug() << "ONNX Runtime 加载异常: " << e.what();
+        if (m_modelLoadError.isEmpty()) {
+            m_modelLoadError = QString::fromUtf8(e.what());
+        }
     } catch (const std::exception& e) {
         qDebug() << "标准异常: " << e.what();
+        if (m_modelLoadError.isEmpty()) {
+            m_modelLoadError = QString::fromUtf8(e.what());
+        }
     }
+    delete m_ortSession;
+    m_ortSession = nullptr;
+    return false;
 }
+
 
 
 DnnThread::~DnnThread() {
@@ -269,19 +313,29 @@ void DnnThread::updateDnn(const cv::Mat &frame) {
 }
 
 
-void DnnThread::initDnn(const cv::Mat &frame, const cv::Rect2d &target) {
+quint64 DnnThread::initDnn(const cv::Mat &frame, const cv::Rect2d &target) {
     QMutexLocker locker(&m_mutex);
-    if(frame.empty()) return;
+    if(frame.empty()) return 0;
+    // 新会话：旧会话尚未处理的帧和锁定状态全部作废，正在推理中的旧结果会因 ID 不匹配被丢弃。
+    m_sessionId = nextDnnSessionId();
+    m_hasNewFrame = false;
+    m_frame.release();
+    m_useYolo = false;
+    m_lockedClassId = -1;
+    m_dnnMissCount = 0;
+    m_lastYoloRect = cv::Rect2d();
     m_initFrame = frame;
     m_initRect = target;
     m_needInit = true;
     m_isTracking = true;
     m_workAvailable.wakeOne();
+    return m_sessionId;
 }
 
 
 void DnnThread::stopDnn() {
     QMutexLocker locker(&m_mutex);
+    m_sessionId = nextDnnSessionId();
     m_isTracking = false;
     m_needInit = false;
     m_needDetection = false;
@@ -297,6 +351,19 @@ void DnnThread::stopDnn() {
 
 
 void DnnThread::run() {
+    // 模型加载在推理线程执行，完成后通过 modelLoadFinished 通知（GUI 可显示“加载模型中”）。
+    if (!isInterruptionRequested()) {
+        const bool loaded = loadModel();
+        m_modelState.store(static_cast<int>(loaded ? ModelState::Ready : ModelState::Failed),
+                           std::memory_order_release);
+        emit modelLoadFinished(
+            loaded,
+            loaded ? QStringLiteral("YOLO 模型加载完成：%1").arg(modelFileName())
+                   : QStringLiteral("YOLO 模型加载失败：%1").arg(m_modelLoadError));
+    } else {
+        m_modelState.store(static_cast<int>(ModelState::Failed), std::memory_order_release);
+    }
+
     // ONNX Runtime（尤其是 CUDA Provider）的第一次 Run 会创建 CUDA 上下文、
     // 加载内核并分配显存。提前在后台执行两次空推理，把这笔开销从首次跟踪移走。
     if (m_ortSession == nullptr) {
@@ -340,7 +407,7 @@ void DnnThread::run() {
 
             warmupSuccess = !isInterruptionRequested();
             warmupMessage = warmupSuccess
-                                ? QStringLiteral("YOLO 推理引擎预热完成：%1").arg(m_modelFileName)
+                                ? QStringLiteral("YOLO 推理引擎预热完成：%1").arg(modelFileName())
                                 : QStringLiteral("YOLO 推理引擎预热已取消");
         } catch (const Ort::Exception &e) {
             warmupMessage = QStringLiteral("YOLO 预热失败：%1")
@@ -364,6 +431,7 @@ void DnnThread::run() {
         bool doUpdate = false;
         bool doDetection = false;
         quint64 detectionRequestId = 0;
+        quint64 workSession = 0;
         cv::Rect2d initR;
 
         {
@@ -378,6 +446,7 @@ void DnnThread::run() {
                 break;
             }
 
+            workSession = m_sessionId;
             if (m_needDetection) {
                 doDetection = true;
                 detectionRequestId = m_detectionRequestId;
@@ -734,9 +803,13 @@ void DnnThread::run() {
             cv::Rect2d resultRect;
             QString resultName;
             bool success = false;
+            bool sessionCurrent = false;
             {
                 QMutexLocker locker(&m_mutex);
-                if (best_idx != -1 &&
+                sessionCurrent = (workSession == m_sessionId);
+                if (!sessionCurrent) {
+                    // 推理期间已 stopDnn/initDnn：旧会话的 LOCK 结果不能覆盖新会话状态。
+                } else if (best_idx != -1 &&
                     best_idx < static_cast<int>(classIds.size()) &&
                     classIds[best_idx] >= 0 &&
                     boxes[best_idx].width > 0 &&
@@ -758,7 +831,10 @@ void DnnThread::run() {
             }
             // 引擎回调会获取状态锁；持有输入锁发信号会与 processFrame/stopDnn
             // 的 state -> input 顺序相反。成功与失败结果都必须在解锁后发出。
-            emit dnnTrackedResult(resultRect, success, resultName);
+            // 解锁后仍可能被新会话抢先；引擎侧会再用 sessionId 校验一次。
+            if (sessionCurrent) {
+                emit dnnTrackedResult(resultRect, success, resultName, workSession);
+            }
         } else if (doUpdate) {
             bool currentlyTracking = false;
             bool useYolo = false;
@@ -768,7 +844,7 @@ void DnnThread::run() {
 
             {
                 QMutexLocker locker(&m_mutex);
-                currentlyTracking = m_isTracking;
+                currentlyTracking = m_isTracking && workSession == m_sessionId;
                 useYolo = m_useYolo;
                 lockedClass = m_lockedClassId;
                 lastYoloRect = m_lastYoloRect;
@@ -777,7 +853,7 @@ void DnnThread::run() {
 
             if (currentlyTracking) {
                 if (!useYolo) {
-                    emit dnnTrackedResult(cv::Rect2d(), false, "");
+                    emit dnnTrackedResult(cv::Rect2d(), false, QString(), workSession);
                 } else {
                     // 正常跟踪时按上一位置找近邻；丢失后改为在画面中心附近重捕同类目标。
                     double min_dist = 1e9;
@@ -854,24 +930,35 @@ void DnnThread::run() {
                             detectedRect,
                             processFrame.size(),
                             recoveredAfterMiss);
+                        bool sessionCurrent = false;
                         {
                             QMutexLocker locker(&m_mutex);
-                            m_lastYoloRect = outputRect;
-                            m_dnnMissCount = 0;
+                            sessionCurrent = (workSession == m_sessionId);
+                            if (sessionCurrent) {
+                                m_lastYoloRect = outputRect;
+                                m_dnnMissCount = 0;
+                            }
                         }
 
                         QString cName = yoloClassName(lockedClass, m_classNames);
-                        emit dnnTrackedResult(
-                            outputRect,
-                            true,
-                            recoveredAfterMiss ? QStringLiteral("RECOVER:") + cName : cName);
+                        if (sessionCurrent) {
+                            emit dnnTrackedResult(
+                                outputRect,
+                                true,
+                                recoveredAfterMiss ? QStringLiteral("RECOVER:") + cName : cName,
+                                workSession);
+                        }
                     } else {
                         int missCount = 0;
                         cv::Rect2d holdRect;
                         bool canHold = false;
+                        bool sessionCurrent = false;
                         {
                             QMutexLocker locker(&m_mutex);
-                            m_dnnMissCount++;
+                            sessionCurrent = (workSession == m_sessionId);
+                            if (sessionCurrent) {
+                                m_dnnMissCount++;
+                            }
                             missCount = m_dnnMissCount;
                             if (missCount <= kYoloHoldLostFrames &&
                                 m_lastYoloRect.width > 0 && m_lastYoloRect.height > 0) {
@@ -879,10 +966,14 @@ void DnnThread::run() {
                                 canHold = true;
                             }
                         }
-                        if (canHold) {
-                            emit dnnTrackedResult(holdRect, true, "");
+                        // HOLD 只表示“短暂未检出、沿用上一位置用于显示”，不是新的测量；
+                        // 引擎在 HOLD 期间输出零偏移，避免下位机按旧误差持续转动。
+                        if (!sessionCurrent) {
+                            // 旧会话结果直接丢弃
+                        } else if (canHold) {
+                            emit dnnTrackedResult(holdRect, true, QStringLiteral("HOLD"), workSession);
                         } else {
-                            emit dnnTrackedResult(cv::Rect2d(), false, "");
+                            emit dnnTrackedResult(cv::Rect2d(), false, QString(), workSession);
                         }
                     }
                 }

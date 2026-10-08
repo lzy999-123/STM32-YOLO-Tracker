@@ -47,7 +47,21 @@ CameraManager::~CameraManager()
     safeDeleteCamera(); // 确保安全释放摄像头资源
     // worker 使用本对象；析构前必须等待退出，不能 detach 后释放成员。
     for (auto &worker : m_retiredRtspThreads) {
-        if (worker.joinable()) worker.join();
+        if (worker.thread.joinable()) worker.thread.join();
+    }
+    m_retiredRtspThreads.clear();
+}
+
+void CameraManager::reapRetiredRtspThreads()
+{
+    // 只 join 已经退出的线程，不阻塞 GUI；仍在网络打开/读取中的线程留到下次回收。
+    for (auto it = m_retiredRtspThreads.begin(); it != m_retiredRtspThreads.end();) {
+        if (!it->finished || it->finished->load(std::memory_order_acquire)) {
+            if (it->thread.joinable()) it->thread.join();
+            it = m_retiredRtspThreads.erase(it);
+        } else {
+            ++it;
+        }
     }
 }
 
@@ -84,7 +98,9 @@ void CameraManager::startRtspStream(const QString &url)
     m_rtspFormatErrorReported.store(false, std::memory_order_release);
     const quint64 newSession = ++m_rtspSessionId;
     m_lastFrameTime = QDateTime::currentMSecsSinceEpoch();
-    m_rtspThread = std::make_unique<std::thread>(&CameraManager::rtspWorkerLoop, this, url, newSession);
+    m_rtspThreadFinished = std::make_shared<std::atomic<bool>>(false);
+    m_rtspThread = std::make_unique<std::thread>(
+        &CameraManager::rtspWorkerLoop, this, url, newSession, m_rtspThreadFinished);
 }
 
 void CameraManager::stopRtspStream()
@@ -102,13 +118,15 @@ void CameraManager::stopRtspStream()
     if (m_rtspThread) {
         if (m_rtspThread->joinable()) {
             // 关闭/切换不等待网络读取；析构时统一 join，避免后台访问已释放对象。
-            m_retiredRtspThreads.emplace_back(std::move(*m_rtspThread));
+            m_retiredRtspThreads.push_back({std::move(*m_rtspThread), m_rtspThreadFinished});
             m_rtspThread.reset();
         } else {
             m_rtspThread.reset();
         }
     }
+    m_rtspThreadFinished.reset();
     m_isRtsp = false;
+    reapRetiredRtspThreads();
 }
 
 void CameraManager::notifyNewMat(quint64 sessionId)
@@ -130,8 +148,15 @@ void CameraManager::notifyNewMat(quint64 sessionId)
     }
 }
 
-void CameraManager::rtspWorkerLoop(const QString &url, quint64 sessionId)
+void CameraManager::rtspWorkerLoop(const QString &url, quint64 sessionId,
+                                   std::shared_ptr<std::atomic<bool>> finished)
 {
+    // 任何返回路径都标记线程已结束，GUI 线程据此非阻塞地回收。
+    struct FinishedMarker {
+        std::shared_ptr<std::atomic<bool>> flag;
+        ~FinishedMarker() { if (flag) flag->store(true, std::memory_order_release); }
+    } finishedMarker{std::move(finished)};
+
     if (sessionId != m_rtspSessionId.load() || !m_rtspRunning.load()) return;
 
     const auto streamStart = std::chrono::steady_clock::now();
@@ -174,8 +199,13 @@ void CameraManager::rtspWorkerLoop(const QString &url, quint64 sessionId)
     };
 
     // 环境参数是进程全局的；串行化打开，防止取消后旧会话与新会话相互覆盖。
-    static std::mutex openMutex;
-    std::unique_lock<std::mutex> openLock(openMutex);
+    // 打开过程本身无法中断（受 OPEN_TIMEOUT 限制），但排队等锁的已取消线程
+    // 会周期检查会话并立即退出，不再依次占用打开窗口。
+    static std::timed_mutex openMutex;
+    std::unique_lock<std::timed_mutex> openLock(openMutex, std::defer_lock);
+    while (!openLock.try_lock_for(std::chrono::milliseconds(50))) {
+        if (sessionId != m_rtspSessionId.load() || !m_rtspRunning.load()) return;
+    }
     if (sessionId != m_rtspSessionId.load() || !m_rtspRunning.load()) return;
     setFfmpegOptions(s_tcpOptions);
     qDebug() << "[CameraManager] 开始 720P 低延迟取流 (TCP):" << url;
@@ -465,6 +495,7 @@ void CameraManager::handleNewVideoFrame(const QVideoFrame &frame)
 
 void CameraManager::checkCameraStatus()
 {
+    reapRetiredRtspThreads();
     if (m_cameraState == CameraState::Opening || m_cameraState == CameraState::Closing) return;
 
     qint64 currentTime = QDateTime::currentMSecsSinceEpoch();

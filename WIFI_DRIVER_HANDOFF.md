@@ -3,7 +3,7 @@
 ## 2026-10-08 最新结果
 
 - USB 网卡 RTL8188EU/8188ETV，USB ID `0bda:0179`；内核 `5.10.160`。
-- 已成功加载 r8188eu，关联 Redmi K70E，WPA2-PSK/CCMP 认证完成。
+- 已成功加载 r8188eu，关联手机热点，WPA2-PSK/CCMP 认证完成。
 - DHCP 地址 `10.226.35.30/24`，网关 `10.226.35.207`。地址由热点分配，可能改变。
 - PC `10.226.35.174` 的路由已确认使用 WLAN。
 - 已实际打开 `rtsp://10.226.35.30/live/0` 并解码 1280x720 图像。
@@ -37,6 +37,10 @@
 - 真实热点配置 `/userdata/cfg/wpa_supplicant.conf`，禁止打印密码。
 - 初始化时临时将kernel modprobe设为`/bin/true`，随后恢复原路径`/sbin/modprobe`。
 - ADB `tmp/android-tools/platform-tools/adb.exe`，使用192.168.8.93:5555或当前无线IP:5555；offline时disconnect/connect。
+  - 安全提示：板子的 adbd 通过网络（TCP 5555）提供**无需认证的 root shell**，同一热点/网段内任何设备都能完全控制板子、读取 Wi-Fi 密码和控制密钥。
+    仅在开发调试时开启；交付或在不受信任的网络使用前应关闭网络 ADB：用 `grep -l adbd /etc/init.d/*` 找到固件中启动 adbd 的脚本，
+    去掉其中的 TCP 端口设置或停用该脚本后重启，并用 `netstat -tln` 确认 5555 不再监听；临时可 `killall adbd`。需要时只保留 USB ADB。
+    本仓库的板端脚本不启用 ADB；关闭方式依赖 Luckfox 固件，尚未在本板验证。
 - 视频服务 `rkipc -a /oem/usr/share/iqfiles`。
 
 ## 构建与诊断文件

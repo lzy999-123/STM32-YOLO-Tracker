@@ -4,6 +4,7 @@
 #include <QThread>
 #include <QMutex>
 #include <QWaitCondition>
+#include <atomic>
 #include <opencv2/dnn.hpp>
 #include <opencv2/opencv.hpp>
 #include <onnxruntime_cxx_api.h>
@@ -28,12 +29,16 @@ public:
     explicit DnnThread(const QString &modelFileName, QObject *parent = nullptr);
     ~DnnThread();
 
+    /// @brief 模型加载状态：加载在 run()（推理线程）中进行，构造函数不再阻塞 GUI。
+    enum class ModelState { Loading = 0, Ready = 1, Failed = 2 };
+
     /**
      * @brief 初始化 DNN 跟踪器的锁定目标
      * @param frame 初始化时的完整图像帧
      * @param target 用户框选或追踪引擎锁定的目标初始位置
+     * @return 本次跟踪会话 ID；dnnTrackedResult 携带该 ID，旧会话的结果应被丢弃
      */
-    void initDnn(const cv::Mat &frame, const cv::Rect2d &target);
+    quint64 initDnn(const cv::Mat &frame, const cv::Rect2d &target);
     
     /**
      * @brief 传递新的一帧给 DNN 线程进行处理
@@ -57,20 +62,39 @@ public:
     /// @brief 判断模型是否已经完成了预热（加载到显存/内存完毕）
     bool isWarmedUp();
     
-    /// @brief 判断网络模型是否为空（加载失败或未加载）
-    bool isNetEmpty() { return m_ortSession == nullptr; }
+    /// @brief 判断网络模型当前是否不可用（仍在加载或加载失败）
+    bool isNetEmpty() const { return modelState() != ModelState::Ready; }
+
+    /// @brief 模型是否仍在后台加载
+    bool isModelLoading() const { return modelState() == ModelState::Loading; }
+
+    /// @brief 模型是否已确定加载失败
+    bool isLoadFailed() const { return modelState() == ModelState::Failed; }
+
+    ModelState modelState() const
+    {
+        return static_cast<ModelState>(m_modelState.load(std::memory_order_acquire));
+    }
     
     /// @brief 获取当前加载的模型文件名
-    QString modelFileName() const { return m_modelFileName; }
+    QString modelFileName() const;
 
 signals:
     /**
      * @brief 持续追踪结果的回调信号（用于校验当前目标状态）
      * @param rect 识别到的目标位置
      * @param success 是否成功识别到目标
-     * @param className 目标的分类名称
+     * @param className 目标的分类名称；"HOLD" 表示本帧未检测到目标、仅沿用上一位置（不是新测量）
+     * @param sessionId 产生该结果的跟踪会话 ID（见 initDnn），用于丢弃旧会话结果
      */
-    void dnnTrackedResult(const cv::Rect2d &rect, bool success, const QString &className = "");
+    void dnnTrackedResult(const cv::Rect2d &rect, bool success, const QString &className, quint64 sessionId);
+
+    /**
+     * @brief 模型加载完成信号（在推理线程中发出）
+     * @param success 是否加载成功
+     * @param message 加载结果说明
+     */
+    void modelLoadFinished(bool success, const QString &message);
     
     /**
      * @brief 模型预热完成信号
@@ -99,7 +123,11 @@ protected:
     void run() override;
 
 private:
-    QMutex m_mutex;                       ///< 线程安全锁
+    /// @brief 在推理线程中加载 ONNX 模型；成功返回 true
+    bool loadModel();
+
+    mutable QMutex m_mutex;               ///< 线程安全锁
+    std::atomic<int> m_modelState{static_cast<int>(ModelState::Loading)}; ///< 模型加载状态
     QWaitCondition m_workAvailable;       ///< 有新推理任务时唤醒线程，避免空闲轮询
     QString m_modelFileName;              ///< 模型文件路径
     QString m_modelLoadError;             ///< 模型加载错误信息
@@ -121,6 +149,7 @@ private:
     cv::Mat m_detectFrame;                ///< 供全图检测使用的图像帧
     cv::Rect2d m_initRect;                ///< 初始化时的目标框
     quint64 m_detectionRequestId = 0;     ///< 当前正在处理的检测请求ID
+    quint64 m_sessionId = 0;              ///< 当前跟踪会话 ID，initDnn/stopDnn 时更新
     
     bool m_isTracking;                    ///< 线程运行标志位
     bool m_needInit;                      ///< 是否需要执行初始化标志

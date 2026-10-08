@@ -8,6 +8,21 @@ Luckfox `luckfox-control.py` 将网络消息转换为下述 UART 协议 v2，接
 UDP JSON 消息不超过 1200 字节，所有消息包含 `version: 1`、随机 `session` 和 `type`。
 会话绑定电脑的源 IP 与源端口；同一时刻只接受一个控制端。
 
+### 认证封装（配置密钥时强制）
+
+板端配置 `auth_key`、电脑端存在密钥时，每个 UDP 数据报是外层 JSON：
+
+```json
+{"m": "<内层 JSON 文本>", "auth": "<HMAC-SHA256(key, UTF-8(m)) 的小写十六进制>"}
+```
+
+内层文本就是下表中的消息。板端配置密钥后丢弃一切未封装、签名错误或被篡改的数据报（常数时间比较），
+回复也全部签名；电脑端有密钥时同样只接受签名正确的回复。未配置密钥时双方收发旧的明文内层 JSON，
+板端启动时记录警告。两端密钥必须一致，一端有密钥一端没有时会话无法建立。
+板端记住最近 256 个已建立过的 session，拒绝重复使用旧 session 的 hello，防止重放已结束的会话；
+该集合在板端重启后清空，因此重启前截获的报文在重启后理论上仍可重放（尚未加时间戳防护）。
+发现协议（UDP 39093）的回应按同一格式签名，签名覆盖请求 nonce；发现请求本身不签名。
+
 | 方向 | type | 字段和用途 |
 | --- | --- | --- |
 | Qt → Luckfox | hello | 建立会话；会话过期后使用新的 session，禁止重放旧会话 |
@@ -15,21 +30,25 @@ UDP JSON 消息不超过 1200 字节，所有消息包含 `version: 1`、随机 
 | Qt → Luckfox | heartbeat | 维持网络会话；电脑每 100ms 发一次，1s 超时释放控制权 |
 | Qt → Luckfox | track | `seq`、有符号 int16 范围的 `x`、`y`；偏移以处理后画面中心为原点 |
 | Qt → Luckfox | command | `request`、`cmd`；request 为会话内递增的请求编号 |
-| Luckfox → Qt | status | `seq`、`online`、`mode`、`horizontal`、`vertical`；角度单位为度 |
+| Luckfox → Qt | status | `seq`、`online`、`mode`、`horizontal`、`vertical`、`flags`；角度单位为度，flags 见 TELEMETRY |
 | Luckfox → Qt | ack / command_failed | 原 `request` 与 `cmd`；ack 只能来源于 STM32 的 UART ACK |
-| Qt → Luckfox | bye | 释放会话，板端停止跟踪、回中并停止 UART 心跳 |
+| Qt → Luckfox | bye | 释放会话，板端只发送 CMD 0x12 停止跟踪（不回中）并停止 UART 心跳 |
 
-目标偏移按序号丢弃乱序/重复数据，板端只保留最新值，超过 200ms 不再发送。转发最短间隔 20ms。
+目标偏移按序号丢弃乱序/重复数据。每个新序号只向 UART 转发一次，不再每 20ms 重复同一坐标；
+两次转发最短间隔 20ms，间隔内到达多个新序号时在下一个时隙只转发最新值；收到后超过 200ms 未转发则丢弃。
+下位机采用速度控制并有 200ms 数据超时，坐标不需要重复发送。
 停止、回中、切换模式、重新开始时清除坐标缓存。
 Qt 仅在转发服务响应且 STM32 有效遥测在线时启用控制；遥测超时 1s 禁用。
 网络重发间隔 200ms，最多重发 3 次，使用相同 request。板端缓存结果并去重，手动步进不会因网络 ACK 丢失而重复执行。
-UART 的旧协议不带请求编号，所以板端不重发非幂等命令；等待 ACK 超过 450ms 时报告失败、释放会话并停止控制。
-网络会话超时或退出时停止/回中；停止 UART 心跳后仍由 STM32 自身的链路保护兜底。
+UART 的旧协议不带请求编号，所以板端不重发非幂等命令；等待 ACK 超过 450ms 时向电脑报告 `command_failed`，
+**保留会话**，不停止跟踪、不回中，后续命令可继续发送。
+网络会话超时或 bye 时只发送 CMD 0x12（停止跟踪），不发送 0x02 回中，随后停止 UART 心跳；
+STM32 的 1s 链路超时在自动模式下回中，手动模式保持当前角度（"手动模式不受影响"）。
 status 序号只用于状态顺序，不代表视频帧号；本协议没有测量端到端延迟。
 
 ## Luckfox ↔ STM32 UART 协议 v2
 
-适用：Luckfox 板端 ⇄ STM32 下位机 (`main.c`)。
+适用：Luckfox 板端 ⇄ STM32 下位机 (`main_gimbal.c`，工程 `D:\STM32CubeMx\hal_stm32\科教协同下位机-1`)。
 物理层：UART 115200-8-N-1。字节序：大端（高字节在前）。
 
 ## 1. 帧结构（双向统一）
@@ -52,8 +71,8 @@ status 序号只用于状态顺序，不代表视频帧号；本协议没有测�
 
 | TYPE | 名称        | PAYLOAD                          | 说明 |
 |------|-------------|----------------------------------|------|
-| 0x01 | TRACK_DATA  | int16 offsetX, int16 offsetY     | 目标相对画面中心的像素偏移，合法坐标转发最短间隔 20ms |
-| 0x02 | CMD         | uint8 cmd                        | 控制命令，下位机必须回 ACK |
+| 0x01 | TRACK_DATA  | int16 offsetX, int16 offsetY     | 目标相对画面中心的像素偏移；每个新网络序号转发一次，最短间隔 20ms |
+| 0x02 | CMD         | uint8 cmd                        | 控制命令，下位机必须回 ACK（未知命令码也 ACK，但不执行） |
 | 0x03 | HEARTBEAT   | 无                               | 网络会话有效期间每 200ms 一帧，无需应答 |
 
 CMD 命令码（沿用 v1）：
@@ -76,17 +95,29 @@ CMD 命令码（沿用 v1）：
 
 | TYPE | 名称      | PAYLOAD                                        | 说明 |
 |------|-----------|------------------------------------------------|------|
-| 0x81 | TELEMETRY | uint8 mode, int16 angle1×10, int16 angle2×10   | 每 100ms 一帧；mode: 0=手动 1=自动；角度放大 10 倍传输 |
-| 0x82 | ACK       | uint8 cmd                                      | 对收到的 CMD 的应答，payload 为被应答的命令码 |
+| 0x81 | TELEMETRY | uint8 mode, int16 angle1×10, int16 angle2×10, uint8 flags | 每 100ms 一帧；mode: 0=手动 1=自动；角度放大 10 倍传输；payload 6 字节 |
+| 0x82 | ACK       | uint8 cmd                                      | 对收到的 CMD 的应答，payload 为被应答的命令码；未知命令码同样应答 |
+
+TELEMETRY `flags` 位定义：
+
+| 位 | 含义 |
+|----|------|
+| bit0 | 编码器/系统故障 |
+| bit1 | 急停 |
+| bit2 | 链路丢失（LINK LOST，下位机 1s 未收到合法帧） |
+| bit3~7 | 保留，置 0 |
+
+Luckfox 同时接受旧固件的 5 字节 payload（flags 视为 0）和新固件的 6 字节 payload，其他长度丢弃；
+flags 原样放入网络 status 的 `flags` 字段。Luckfox 只转发，不根据 flags 改变控制行为。
 
 ## 3. 超时与重传
 
 | 机制 | 参数 | 行为 |
 |------|------|------|
 | 网络命令 ACK 重传（Qt） | 200ms 超时，最多重发 3 次 | 同一 request 重发，板端去重；失败发 `commandFailed` |
-| UART 命令 ACK 等待（Luckfox） | 450ms 超时 | 不重发非幂等命令，报告失败并释放会话 |
-| 跟踪数据超时（下位机） | 200ms 无合法 TRACK_DATA | 偏移量清零，云台保持当前角度（目标短暂丢失的正常情形） |
-| 链路超时（下位机） | 1000ms 无任何合法帧 | **失控保护**：停止跟踪、云台回中、OLED 显示 `LINK LOST`（手动模式不受影响） |
+| UART 命令 ACK 等待（Luckfox） | 450ms 超时 | 不重发非幂等命令，报告 `command_failed`，保留会话 |
+| 跟踪数据超时（下位机） | 200ms 无合法 TRACK_DATA | 速度清零，云台保持当前角度（目标短暂丢失或静止目标的正常情形） |
+| 链路超时（下位机） | 1000ms 无任何合法帧 | **失控保护**：自动模式停止跟踪并回中；手动模式不受影响；OLED 显示 `LINK LOST`，TELEMETRY flags bit2 置位 |
 | 遥测超时（上位机） | 1000ms 无 TELEMETRY | UI 显示下位机离线告警 |
 | 网络断线检测（Qt） | 转发服务超过 1s 无有效响应 | 禁用控制、清除待发命令，以新会话重新握手 |
 
@@ -96,8 +127,9 @@ CMD 命令码（沿用 v1）：
 ## 4. 关闭流程（上位机退出）
 
 1. Qt 停止本地跟踪并发送网络 `bye`；
-2. Luckfox 发送 CMD 0x12（停止跟踪）、CMD 0x02（回中），随后停止 UART 心跳；
-3. 网络 bye 丢失时，Luckfox 会话 1s 超时后执行同样处理；STM32 自身仍保留 UART 链路超时保护。
+2. Luckfox 只发送 CMD 0x12（停止跟踪），不发送 0x02 回中，随后停止 UART 心跳；
+3. 网络 bye 丢失时，Luckfox 会话 1s 超时后执行同样处理；
+4. 约 1s 后 STM32 链路超时：自动模式回中，手动模式保持当前角度，OLED 显示 `LINK LOST`。
 
 ## 5. 与 v1 的差异
 

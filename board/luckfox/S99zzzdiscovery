@@ -1,15 +1,66 @@
 #!/bin/sh
+# PIDFILE 记录守护外壳（本脚本 supervise）；外壳在 Python 退出后 2s 重启它，配置错误（退出码 2）除外。
+PIDFILE=/var/run/luckfox-discovery.pid
+CHILD_PIDFILE=/var/run/luckfox-discovery.child.pid
+SCRIPT=/oem/usr/bin/luckfox-discovery.py
+CONFIG=/userdata/cfg/luckfox-control.json
+LOG=/tmp/luckfox-discovery.log
+SELF=$(readlink -f "$0" 2>/dev/null) || SELF=$0
+pid_matches() {
+  [ -f "$1" ] || return 1
+  check_pid=$(cat "$1")
+  case "$check_pid" in ''|*[!0-9]*) return 1 ;; esac
+  [ -r "/proc/$check_pid/cmdline" ] || return 1
+  shift
+  for check_arg in "$@"; do
+    tr '\000' '\n' < "/proc/$check_pid/cmdline" | grep -Fxq -- "$check_arg" || return 1
+  done
+}
+running() { pid_matches "$PIDFILE" "$SELF" supervise; }
+child_running() { pid_matches "$CHILD_PIDFILE" "$SCRIPT"; }
+stop_child() {
+  child_running || return 0
+  kill "$(cat "$CHILD_PIDFILE")" 2>/dev/null
+  for discovery_wait in 1 2 3; do child_running || return 0; sleep 1; done
+  child_running && return 1
+  return 0
+}
 case "$1" in
-start)
-    if [ -f /var/run/luckfox-discovery.pid ] && kill -0 "$(cat /var/run/luckfox-discovery.pid)" 2>/dev/null; then
-        exit 0
-    fi
-    nohup /usr/bin/python3 /oem/usr/bin/luckfox-discovery.py >/tmp/luckfox-discovery.log 2>&1 </dev/null &
-    echo $! > /var/run/luckfox-discovery.pid
+  supervise)
+    child=
+    trap '[ -n "$child" ] && kill "$child" 2>/dev/null && wait "$child"; rm -f "$CHILD_PIDFILE"; exit 0' TERM INT
+    while :; do
+      /usr/bin/python3 -S "$SCRIPT" --config "$CONFIG" </dev/null &
+      child=$!
+      echo "$child" > "$CHILD_PIDFILE"
+      wait "$child"
+      code=$?
+      child=
+      rm -f "$CHILD_PIDFILE"
+      [ "$code" -eq 2 ] && { echo "discovery: 配置错误，停止自动重启"; exit 2; }
+      echo "discovery: 进程退出（$code），2s 后重启"
+      sleep 2 &
+      wait $!
+    done
+    ;;
+  start)
+    running && exit 0
+    stop_child || { echo "discovery: 无法结束遗留进程"; exit 1; }
+    rm -f "$PIDFILE" "$CHILD_PIDFILE"
+    start-stop-daemon -S -b -m -p "$PIDFILE" -x /bin/sh -- -c 'exec /bin/sh "$1" supervise >>"$2" 2>&1 </dev/null' discovery "$SELF" "$LOG" || exit 1
     sleep 1
+    running || { echo "discovery: 启动失败，请检查 $LOG"; rm -f "$PIDFILE"; exit 1; }
     ;;
-stop)
-    [ ! -f /var/run/luckfox-discovery.pid ] || kill "$(cat /var/run/luckfox-discovery.pid)" 2>/dev/null
+  stop)
+    if running; then
+      kill "$(cat "$PIDFILE")" 2>/dev/null
+      for discovery_wait in 1 2 3 4 5; do running || break; sleep 1; done
+      running && { echo "discovery: 停止超时"; exit 1; }
+    fi
+    stop_child || { echo "discovery: 停止超时"; exit 1; }
+    rm -f "$PIDFILE" "$CHILD_PIDFILE"
     ;;
-*) exit 1 ;;
+  restart) "$0" stop && "$0" start ;;
+  status) running && { echo "discovery: 正在运行"; exit 0; }; echo "discovery: 未运行"; exit 1 ;;
+  *) echo "usage: $0 {start|stop|restart|status}"; exit 1 ;;
 esac

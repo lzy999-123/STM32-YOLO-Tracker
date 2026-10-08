@@ -135,6 +135,12 @@ private:
     /// @brief 安全停止跟踪，避免后台帧仍在访问引擎
     void stopTrackingSafely();
 
+    /// @brief 若有尚未下发的新跟踪结果，且满足 20ms 最小间隔，则下发一次偏移
+    void flushTrackData();
+
+    /// @brief 把图像坐标系下的偏移换算为云台控制方向（处理仅用于显示的镜像/翻转）
+    QPoint controlOffsets() const;
+
     /// @brief 执行一次固定 0.5° 的手动步进
     void sendManualStep(uint8_t cmd, const QString &direction);
     
@@ -197,6 +203,9 @@ private:
     qint64 m_lastDisplayFrameTime = 0;      ///< 最近一次显示帧时间戳，用于本地摄像头节流
     int m_dnnFrameSkipCounter = 0;           ///< 跳帧计数器（降低刷新率）
     int m_lostFrameCount = 0;                ///< 丢失目标的持续帧数
+    quint64 m_lastTrackResultSeq = 0;        ///< 最近一次接收的跟踪结果序号
+    bool m_trackResultPending = false;       ///< 是否有新结果（或丢失后的零偏移）尚未下发
+    bool m_selectDragActive = false;         ///< 本次框选的按下点是否有效（已落在图像内）
 
     // CSRT/ORB 更新可能超过一帧周期，不能阻塞 GUI 线程。这里采用单线程、最新帧覆盖策略。
     std::mutex m_trackingWorkerMutex;

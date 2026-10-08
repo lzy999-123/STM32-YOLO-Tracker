@@ -110,18 +110,34 @@ MainWindow::MainWindow(QWidget *parent, bool autoConnect)
     setupNetworkUi();
     testDNN();
 
+    // CSRT 在后台线程运行，targetTracked/targetLost 以排队方式送达；停止或重新开始后，
+    // 旧会话残留的信号仍可能到达。按会话代号丢弃旧信号，避免停止后继续下发旧偏移。
     connect(&m_trackingEngine, &TrackingEngine::targetTracked, this,
-            [this](const cv::Rect2d &rect, int offsetX, int offsetY) {
+            [this](const cv::Rect2d &rect, int offsetX, int offsetY,
+                   quint64 generation, quint64 resultSeq) {
+        if (generation != m_trackingEngine.trackingGeneration() || !m_isCapturing) return;
         m_trackedRect = rect;
         m_isTargetTracked = true;
         m_offsetX = static_cast<int16_t>(offsetX);
         m_offsetY = static_cast<int16_t>(offsetY);
+        if (resultSeq != m_lastTrackResultSeq) {
+            m_lastTrackResultSeq = resultSeq;
+            m_trackResultPending = true;
+        }
+        flushTrackData();
     });
-    connect(&m_trackingEngine, &TrackingEngine::targetLost, this, [this]() {
+    connect(&m_trackingEngine, &TrackingEngine::targetLost, this, [this](quint64 generation) {
+        if (generation != m_trackingEngine.trackingGeneration()) return;
+        const bool wasTracked = m_isTargetTracked;
         m_isTargetTracked = false;
         m_trackedRect = cv::Rect2d();
         m_offsetX = 0;
         m_offsetY = 0;
+        // 刚丢失时补发一次零偏移，让下位机立即停止，而不是等待超时。
+        if (wasTracked && m_isCapturing) {
+            m_trackResultPending = true;
+            flushTrackData();
+        }
     });
     connect(&m_trackingEngine, &TrackingEngine::logMessage, this, [this](const QString &msg) {
         if (ui->plainTextEdit_2) {
@@ -157,8 +173,13 @@ MainWindow::MainWindow(QWidget *parent, bool autoConnect)
     });
     connect(&m_networkController, &NetworkController::telemetryReceived, this,
             [this](int mode, float horizontal, float vertical) {
-        m_gimbalStatus->setText(QStringLiteral("云台在线 · 水平 %1° / 垂直 %2°")
-            .arg(horizontal, 0, 'f', 1).arg(vertical, 0, 'f', 1));
+        const int flags = m_networkController.telemetryFlags();
+        QString alarm;
+        if (flags & NetworkController::FlagFault) alarm += QStringLiteral(" · 编码器故障");
+        if (flags & NetworkController::FlagEmergencyStop) alarm += QStringLiteral(" · 急停");
+        if (flags & NetworkController::FlagLinkLost) alarm += QStringLiteral(" · 链路丢失");
+        m_gimbalStatus->setText(QStringLiteral("云台在线 · 水平 %1° / 垂直 %2°%3")
+            .arg(horizontal, 0, 'f', 1).arg(vertical, 0, 'f', 1).arg(alarm));
         if (mode != m_lastRemoteMode) {
             m_modeSwitchPending = false;
             m_lastRemoteMode = mode;
@@ -168,6 +189,18 @@ MainWindow::MainWindow(QWidget *parent, bool autoConnect)
         ui->label_11->setText(mode == 0 ? QStringLiteral("手动") : QStringLiteral("自动"));
         updateManualControlAvailability();
         updateTrackingControlAvailability();
+    });
+    connect(&m_networkController, &NetworkController::telemetryFlagsChanged, this, [this](int flags) {
+        qInfo() << "[Device] telemetry_flags=" << flags;
+        if (flags & (NetworkController::FlagFault | NetworkController::FlagEmergencyStop)) {
+            ui->plainTextEdit_2->appendPlainText(QStringLiteral("【云台】%1，已停止本地跟踪")
+                .arg(flags & NetworkController::FlagFault ? QStringLiteral("下位机报告编码器/系统故障")
+                                                          : QStringLiteral("下位机处于急停状态")));
+            stopLocalControl();
+        } else if (flags & NetworkController::FlagLinkLost) {
+            ui->plainTextEdit_2->appendPlainText(QStringLiteral("【云台】下位机报告链路丢失"));
+        }
+        updateGimbalStatus();
     });
 
     ui->comboBox_4->clear();
@@ -238,6 +271,20 @@ MainWindow::MainWindow(QWidget *parent, bool autoConnect)
         }
         ui->plainTextEdit_2->appendPlainText(QStringLiteral("【设备连接】%1").arg(message));
         ui->statusbar->showMessage(QStringLiteral("未找到设备，请检查同一 Wi-Fi；程序会自动重试"), 6000);
+    });
+    connect(&m_luckfoxDiscovery, &LuckfoxDiscovery::lockedDeviceMissing, this,
+            [this](const QString &otherId) {
+        // 延后到事件循环处理，避免在设备发现的定时器回调里打开模态对话框并重入 start()。
+        QTimer::singleShot(0, this, [this, otherId] {
+            const auto answer = QMessageBox::question(this, QStringLiteral("设备发现"),
+                QStringLiteral("已记住的 Luckfox（%1）多次未响应，但发现了另一台设备 %2。\n"
+                               "是否忘记旧设备并连接新设备？")
+                    .arg(m_luckfoxDiscovery.lockedDeviceId(), otherId));
+            if (answer != QMessageBox::Yes) return;
+            m_luckfoxDiscovery.forgetDevice();
+            ui->plainTextEdit_2->appendPlainText(QStringLiteral("【设备连接】已忘记旧设备，重新搜索"));
+            m_luckfoxDiscovery.start();
+        });
     });
 
     connect(ui->comboBox_3, QOverload<int>::of(&QComboBox::currentIndexChanged),
@@ -312,12 +359,21 @@ MainWindow::MainWindow(QWidget *parent, bool autoConnect)
 
 MainWindow::~MainWindow()
 {
+    // 先断开各工作对象到本窗口的连接：停止过程以及成员析构时发出的信号
+    // 不能再进入访问 ui 的槽函数。
+    disconnect(&m_trackingEngine, nullptr, this, nullptr);
+    disconnect(&m_cameraManager, nullptr, this, nullptr);
+    disconnect(&m_networkController, nullptr, this, nullptr);
+    disconnect(&m_luckfoxDiscovery, nullptr, this, nullptr);
+    disconnect(&m_hostWifi, nullptr, this, nullptr);
     m_deviceReconnectTimer.stop();
     m_luckfoxDiscovery.cancel();
+    m_isCapturing = false;
     stopTrackingSafely();
     m_cameraManager.closeCamera();
     m_networkController.disconnectDevice();
     delete ui;
+    ui = nullptr;
 }
 
 void MainWindow::dispatchTrackingFrame(const cv::Mat &frame)
@@ -375,8 +431,47 @@ void MainWindow::waitForTrackingWorker()
 
 void MainWindow::stopTrackingSafely()
 {
+    // 所有停止路径都先清除本地跟踪结果，再等待后台帧结束并停止引擎；
+    // 引擎会递增会话代号，之后到达的旧 targetTracked 会被丢弃。
+    m_isTargetTracked = false;
+    m_trackedRect = cv::Rect2d();
+    m_offsetX = 0;
+    m_offsetY = 0;
+    m_trackResultPending = false;
     waitForTrackingWorker();
     m_trackingEngine.stopTracking();
+}
+
+QPoint MainWindow::controlOffsets() const
+{
+    // 偏移是在经过方向变换后的画面上计算的。约定：
+    // - 旋转 180°/90°/270° 视为“安装方向校正”：校正后的画面与云台真实方向一致，
+    //   偏移保持在校正后的画面坐标系中，不再取反（下位机按正装相机标定方向）。
+    // - 水平镜像 / 垂直翻转只是显示偏好，真实场景并未镜像：下发前把对应轴取反，
+    //   保证云台仍朝真实目标方向转动。
+    int x = m_offsetX;
+    int y = m_offsetY;
+    const CameraManager::RotationMode mode = m_cameraManager.rotationMode();
+    if (mode == CameraManager::RotationMode::MirrorH) x = -x;
+    if (mode == CameraManager::RotationMode::MirrorV) y = -y;
+    return QPoint(x, y);
+}
+
+void MainWindow::flushTrackData()
+{
+    if (!m_trackResultPending || !m_isCapturing || !m_networkController.isOpen()) return;
+    {
+        QMutexLocker modeLocker(&m_modeMutex);
+        if (m_currentMode != 1) return;
+    }
+    // 只在有新结果时发送，且保留 20ms 最小间隔；被限流的结果在下一帧补发最新值。
+    const qint64 currentTime = QDateTime::currentMSecsSinceEpoch();
+    if (currentTime - m_lastControlSendTime < 20) return;
+    const QPoint offsets = controlOffsets();
+    m_networkController.sendTrackData(static_cast<int16_t>(std::clamp(offsets.x(), -32768, 32767)),
+                                      static_cast<int16_t>(std::clamp(offsets.y(), -32768, 32767)));
+    m_lastControlSendTime = currentTime;
+    m_trackResultPending = false;
 }
 
 QString MainWindow::currentTrackingModelFileName() const
@@ -994,30 +1089,23 @@ void MainWindow::processLatestVideoFrame()
     }
     if (m_cameraManager.state() != CameraManager::CameraState::Open) return;
 
-    {
-        QMutexLocker modeLocker(&m_modeMutex);
-        if (m_networkController.isOpen() && m_currentMode == 1 && m_isTargetTracked) {
-            const qint64 currentTime = QDateTime::currentMSecsSinceEpoch();
-            if (currentTime - m_lastControlSendTime >= 20) {
-                m_networkController.sendTrackData(m_offsetX, m_offsetY);
-                m_lastControlSendTime = currentTime;
-            }
-        }
-    }
+    flushTrackData();
 
     const qint64 nowMs = QDateTime::currentMSecsSinceEpoch();
     if (nowMs - m_lastInfoUpdateTime >= 100) {
         m_lastInfoUpdateTime = nowMs;
         if (m_isCapturing && !m_trackedRect.empty()) {
+            // 显示实际下发的控制偏移（已处理镜像/翻转）。
+            const QPoint control = controlOffsets();
             QString info;
-            info += QStringLiteral("X 偏移：%1\n").arg(m_offsetX);
-            info += QStringLiteral("Y 偏移：%1\n").arg(m_offsetY);
-            info += (m_offsetX > 0) ? QStringLiteral("舵机X → 向右转\n")
-                                    : (m_offsetX < 0) ? QStringLiteral("舵机X → 向左转\n")
-                                                      : QStringLiteral("舵机X → 居中\n");
-            info += (m_offsetY > 0) ? QStringLiteral("舵机Y → 向下转\n")
-                                    : (m_offsetY < 0) ? QStringLiteral("舵机Y → 向上转\n")
-                                                      : QStringLiteral("舵机Y → 居中\n");
+            info += QStringLiteral("X 偏移：%1\n").arg(control.x());
+            info += QStringLiteral("Y 偏移：%1\n").arg(control.y());
+            info += (control.x() > 0) ? QStringLiteral("舵机X → 向右转\n")
+                                      : (control.x() < 0) ? QStringLiteral("舵机X → 向左转\n")
+                                                          : QStringLiteral("舵机X → 居中\n");
+            info += (control.y() > 0) ? QStringLiteral("舵机Y → 向下转\n")
+                                      : (control.y() < 0) ? QStringLiteral("舵机Y → 向上转\n")
+                                                          : QStringLiteral("舵机Y → 居中\n");
             ui->plainTextEdit->setPlainText(info);
         } else if (!m_waitingForRecover) {
             ui->plainTextEdit->setPlainText(QStringLiteral("X：—\nY：—"));
@@ -1047,12 +1135,15 @@ void MainWindow::on_btnSelectTarget_clicked()
         return;
     }
 
-    stopTrackingSafely();
     m_isCapturing = false;
+    stopTrackingSafely();
     m_hasSelectedTarget = false;
     m_trackedRect = cv::Rect2d();
     m_isTargetTracked = false;
+    m_offsetX = 0;
+    m_offsetY = 0;
     m_isSelecting = true;
+    m_selectDragActive = false;
     m_lostFrameCount = 0;
     m_selectStart = QPoint();
     m_selectEnd = QPoint();
@@ -1087,6 +1178,10 @@ void MainWindow::on_btnStartTracking_clicked()
     }
 
     const bool useFeatureTracking = isFeatureTrackingSelected();
+    if (!useFeatureTracking && m_trackingEngine.yoloLoading()) {
+        ui->plainTextEdit_2->appendPlainText(QStringLiteral("【提示】YOLO 模型正在后台加载，请稍候再开始跟踪。"));
+        return;
+    }
     if (!useFeatureTracking && !m_trackingEngine.yoloReady()) {
         ui->plainTextEdit_2->appendPlainText(
             QStringLiteral("【错误】YOLO26 模型加载失败，请检查程序目录或当前工作目录中的 yolo26s.onnx / yolo26n.onnx！"));
@@ -1109,6 +1204,11 @@ void MainWindow::on_btnStartTracking_clicked()
     m_isCapturing = true;
     m_wasTrackingBeforeDisconn = true;
     m_lostFrameCount = 0;
+    m_isTargetTracked = false;
+    m_trackedRect = cv::Rect2d();
+    m_offsetX = 0;
+    m_offsetY = 0;
+    m_trackResultPending = false;
     waitForTrackingWorker();
     m_trackingEngine.startTracking(
         currentFrameClone,
@@ -1170,6 +1270,7 @@ void MainWindow::mousePressEvent(QMouseEvent *event)
 
     m_selectStart = localPos;
     m_selectEnd = localPos;
+    m_selectDragActive = false;
     QSize frameSize;
     {
         QMutexLocker locker(&m_frameSizeMutex);
@@ -1183,7 +1284,10 @@ void MainWindow::mousePressEvent(QMouseEvent *event)
     const int xOffset = (labelSize.width() - scaledImageSize.width()) / 2;
     const int yOffset = (labelSize.height() - scaledImageSize.height()) / 2;
     const QRect displayedImageRect(QPoint(xOffset, yOffset), scaledImageSize);
-    if (!displayedImageRect.contains(localPos)) return;
+    // 按在黑边（letterbox）区域时夹到图像边缘，与移动/松开的处理一致，
+    // 避免沿用上一次框选遗留的起点。
+    localPos.setX(std::clamp(localPos.x(), displayedImageRect.left(), displayedImageRect.right()));
+    localPos.setY(std::clamp(localPos.y(), displayedImageRect.top(), displayedImageRect.bottom()));
 
     const double scaleX = static_cast<double>(imageSize.width()) / scaledImageSize.width();
     const double scaleY = static_cast<double>(imageSize.height()) / scaledImageSize.height();
@@ -1191,6 +1295,7 @@ void MainWindow::mousePressEvent(QMouseEvent *event)
         static_cast<int>((localPos.x() - xOffset) * scaleX),
         static_cast<int>((localPos.y() - yOffset) * scaleY));
     m_selectEndImg = m_selectStartImg;
+    m_selectDragActive = true;
 }
 
 void MainWindow::mouseMoveEvent(QMouseEvent *event)
@@ -1201,7 +1306,7 @@ void MainWindow::mouseMoveEvent(QMouseEvent *event)
     }
 
     QPoint localPos = ui->imageLabel->mapFromGlobal(event->globalPosition().toPoint());
-    if (!ui->imageLabel->rect().contains(localPos)) return;
+    if (!m_selectDragActive || !ui->imageLabel->rect().contains(localPos)) return;
     m_selectEnd = localPos;
 
     QSize frameSize;
@@ -1235,7 +1340,8 @@ void MainWindow::mouseReleaseEvent(QMouseEvent *event)
     }
 
     QPoint localPos = ui->imageLabel->mapFromGlobal(event->globalPosition().toPoint());
-    if (!ui->imageLabel->rect().contains(localPos) || event->button() != Qt::LeftButton) {
+    if (!m_selectDragActive || !ui->imageLabel->rect().contains(localPos) ||
+        event->button() != Qt::LeftButton) {
         QMainWindow::mouseReleaseEvent(event);
         return;
     }
@@ -1263,6 +1369,7 @@ void MainWindow::mouseReleaseEvent(QMouseEvent *event)
         static_cast<int>((localPos.x() - xOffset) * scaleX),
         static_cast<int>((localPos.y() - yOffset) * scaleY));
     m_isSelecting = false;
+    m_selectDragActive = false;
 
     const QRect selectRect = QRect(m_selectStartImg, m_selectEndImg)
                                  .normalized()
@@ -1370,7 +1477,9 @@ void MainWindow::updateTrackingControlAvailability()
     } else if (!m_hasSelectedTarget) {
         ui->btnStartTracking->setToolTip(QStringLiteral("请先选择目标"));
     } else if (!modelReady) {
-        ui->btnStartTracking->setToolTip(QStringLiteral("追踪模型尚未准备好"));
+        ui->btnStartTracking->setToolTip(m_trackingEngine.yoloLoading()
+                                             ? QStringLiteral("加载模型中，请稍候")
+                                             : QStringLiteral("追踪模型尚未准备好"));
     } else {
         ui->btnSelectTarget->setToolTip(QStringLiteral("在画面中框选目标"));
         ui->btnStartTracking->setToolTip(QStringLiteral("开始自动追踪"));

@@ -22,7 +22,109 @@ private slots:
     void controlConnectionSurvivesVideoCloseAndRefresh();
     void liveDeviceStartupVideoAndRefresh();
     void handshakeRetriesWithNewSessionAfterSilence();
+    void staleTrackingSignalsAreDroppedByGeneration();
+    void trackDataOnlyForNewResults();
+    void engineHoldAndStaleDnnSessionGiveNoOffset();
+    void mirrorOptionsInvertControlOffsets();
 };
+
+void TrackingConcurrencyTest::staleTrackingSignalsAreDroppedByGeneration()
+{
+    MainWindow window(nullptr, false);
+    window.m_isCapturing = true;
+    const quint64 oldGeneration = window.m_trackingEngine.trackingGeneration();
+    // 模拟 CSRT 后台线程在 join 之前排队的旧结果。
+    std::thread worker([&] {
+        emit window.m_trackingEngine.targetTracked(cv::Rect2d(10, 10, 50, 50), 120, -80, oldGeneration, 1);
+    });
+    worker.join();
+    // 停止并立即开始新会话（例如重新框选/切换模型后再次开始），旧信号随后才送达。
+    window.stopTrackingSafely();
+    window.m_isCapturing = true;
+    QVERIFY(window.m_trackingEngine.trackingGeneration() != oldGeneration);
+    QCoreApplication::processEvents();
+    QVERIFY2(!window.m_isTargetTracked, "Stale targetTracked from an old session re-enabled tracking");
+    QCOMPARE(int(window.m_offsetX), 0);
+    QCOMPARE(int(window.m_offsetY), 0);
+    QVERIFY(!window.m_trackResultPending);
+
+    // 当前会话的信号仍然有效。
+    const quint64 current = window.m_trackingEngine.trackingGeneration();
+    emit window.m_trackingEngine.targetTracked(cv::Rect2d(10, 10, 50, 50), 30, 40, current, 2);
+    QVERIFY(window.m_isTargetTracked);
+    QCOMPARE(int(window.m_offsetX), 30);
+    window.m_isCapturing = false;
+}
+
+void TrackingConcurrencyTest::trackDataOnlyForNewResults()
+{
+    MainWindow window(nullptr, false);
+    window.m_isCapturing = true;
+    const quint64 generation = window.m_trackingEngine.trackingGeneration();
+    emit window.m_trackingEngine.targetTracked(cv::Rect2d(10, 10, 50, 50), 30, 40, generation, 5);
+    QVERIFY(window.m_trackResultPending); // 控制通道未连接，结果保持待发送
+    window.m_trackResultPending = false;  // 模拟已经发送
+    emit window.m_trackingEngine.targetTracked(cv::Rect2d(10, 10, 50, 50), 30, 40, generation, 5);
+    QVERIFY2(!window.m_trackResultPending, "Unchanged result was queued again for every video frame");
+    emit window.m_trackingEngine.targetTracked(cv::Rect2d(12, 10, 50, 50), 32, 40, generation, 6);
+    QVERIFY(window.m_trackResultPending);
+    window.m_trackResultPending = false;
+    emit window.m_trackingEngine.targetLost(generation);
+    QVERIFY2(window.m_trackResultPending, "Loss should queue one zero-offset frame");
+    QCOMPARE(int(window.m_offsetX), 0);
+    window.m_isCapturing = false;
+}
+
+void TrackingConcurrencyTest::engineHoldAndStaleDnnSessionGiveNoOffset()
+{
+    TrackingEngine engine;
+    engine.setFrameSize(QSize(1280, 720));
+    {
+        std::lock_guard<std::recursive_mutex> lock(engine.m_stateMutex);
+        engine.m_isCapturing = true;
+        engine.m_useFeatureTracking = false;
+        engine.m_dnnSessionId = 42;
+    }
+    engine.onDnnTrackedResult(cv::Rect2d(900, 500, 60, 60), true, QStringLiteral("LOCK:cup"), 42);
+    QVERIFY(engine.m_isTargetTracked);
+    QVERIFY(engine.m_offsetX != 0);
+    const quint64 seq = engine.m_resultSeq;
+    // HOLD：沿用旧位置，偏移必须为 0，但仍是一次新结果（下发 0）。
+    engine.onDnnTrackedResult(cv::Rect2d(900, 500, 60, 60), true, QStringLiteral("HOLD"), 42);
+    QVERIFY(engine.m_isTargetTracked);
+    QCOMPARE(engine.m_offsetX, 0);
+    QCOMPARE(engine.m_offsetY, 0);
+    QVERIFY(engine.m_resultSeq != seq);
+    // 未检出但在容忍期内：保持显示，偏移为 0。
+    engine.onDnnTrackedResult(cv::Rect2d(900, 500, 60, 60), true, QStringLiteral("cup"), 42);
+    QVERIFY(engine.m_offsetX != 0);
+    engine.onDnnTrackedResult(cv::Rect2d(), false, QString(), 42);
+    QVERIFY(engine.m_isTargetTracked);
+    QCOMPARE(engine.m_offsetX, 0);
+    // 旧会话的结果被丢弃。
+    const quint64 seqBeforeStale = engine.m_resultSeq;
+    engine.onDnnTrackedResult(cv::Rect2d(100, 100, 60, 60), true, QStringLiteral("LOCK:cup"), 41);
+    QCOMPARE(engine.m_resultSeq, seqBeforeStale);
+    QCOMPARE(engine.m_offsetX, 0);
+    engine.stopTracking();
+    QVERIFY(!engine.m_isTargetTracked);
+}
+
+void TrackingConcurrencyTest::mirrorOptionsInvertControlOffsets()
+{
+    MainWindow window(nullptr, false);
+    window.m_offsetX = 50;
+    window.m_offsetY = -30;
+    window.m_cameraManager.setRotationMode(CameraManager::RotationMode::Normal);
+    QCOMPARE(window.controlOffsets(), QPoint(50, -30));
+    window.m_cameraManager.setRotationMode(CameraManager::RotationMode::MirrorH);
+    QCOMPARE(window.controlOffsets(), QPoint(-50, -30));
+    window.m_cameraManager.setRotationMode(CameraManager::RotationMode::MirrorV);
+    QCOMPARE(window.controlOffsets(), QPoint(50, 30));
+    window.m_cameraManager.setRotationMode(CameraManager::RotationMode::Rotate180);
+    QCOMPARE(window.controlOffsets(), QPoint(50, -30));
+    window.m_cameraManager.setRotationMode(CameraManager::RotationMode::Normal);
+}
 
 void TrackingConcurrencyTest::handshakeRetriesWithNewSessionAfterSilence()
 {
@@ -219,7 +321,7 @@ void TrackingConcurrencyTest::inferenceCallbacksDoNotBlockGui()
     while (!held) std::this_thread::yield();
     std::thread inference([&] {
         if (detection) emit thread->yoloDetectionResult(cv::Rect2d(), -1, 0, 1, true);
-        else emit thread->dnnTrackedResult(cv::Rect2d(), false, QString());
+        else emit thread->dnnTrackedResult(cv::Rect2d(), false, QString(), 0);
     });
     QElapsedTimer clock;
     clock.start();
@@ -239,7 +341,8 @@ void TrackingConcurrencyTest::inferenceCallbacksDoNotBlockGui()
 void TrackingConcurrencyTest::initializationSignalReleasesInputLock()
 {
     DnnThread thread(QStringLiteral("yolo26n.onnx"));
-    QVERIFY(!thread.isNetEmpty());
+    // 模型在 run() 中异步加载；构造函数不再阻塞调用线程。
+    QVERIFY(thread.isModelLoading());
     std::atomic<bool> emitted{false};
     std::atomic<bool> unlocked{false};
     connect(&thread, &DnnThread::dnnTrackedResult, &thread,
@@ -249,7 +352,9 @@ void TrackingConcurrencyTest::initializationSignalReleasesInputLock()
             emitted = true;
         }, Qt::DirectConnection);
     thread.start();
-    thread.initDnn(cv::Mat::zeros(360, 640, CV_8UC3), cv::Rect2d(100, 100, 80, 80));
+    QTRY_VERIFY_WITH_TIMEOUT(!thread.isModelLoading(), 15000);
+    QVERIFY(!thread.isNetEmpty());
+    QVERIFY(thread.initDnn(cv::Mat::zeros(360, 640, CV_8UC3), cv::Rect2d(100, 100, 80, 80)) != 0);
     QElapsedTimer deadline;
     deadline.start();
     while (!emitted && deadline.elapsed() < 15000) QTest::qWait(10);

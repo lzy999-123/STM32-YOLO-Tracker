@@ -1,5 +1,6 @@
 # Qt
 build/
+!/board/luckfox/build/
 *.user
 *.user.*
 debug/
@@ -28,3 +29,9 @@ runs/
 .idea/
 .qtcreator/
 .claude/
+
+# Local hardware diagnostics, build VM, downloads and private captures
+/tmp/
+/.codex-tmp/
+__pycache__/
+*.pyc

@@ -124,6 +124,7 @@ void SerialController::writeFrame(const QByteArray &frame)
 {
     if (!m_serial.isOpen()) return;
     m_serial.write(frame);
+    m_serial.flush(); // 立即将字节推向操作系统串口底层硬件，消除 Qt 事件循环排队延迟
 }
 
 void SerialController::sendTrackData(int16_t offsetX, int16_t offsetY)

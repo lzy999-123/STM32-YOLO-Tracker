@@ -1,4 +1,4 @@
-QT       += core gui serialport  multimedia multimediawidgets widgets
+QT       += core gui network serialport  multimedia multimediawidgets widgets
 
 greaterThan(QT_MAJOR_VERSION, 4): QT += widgets
 
@@ -6,6 +6,7 @@ CONFIG += c++17
 
 SOURCES += \
     main.cpp \
+    luckfoxdiscovery.cpp \
     mainwindow.cpp \
     serialcontroller.cpp \
     cameramanager.cpp \
@@ -14,6 +15,7 @@ SOURCES += \
 
 HEADERS += \
     mainwindow.h \
+    luckfoxdiscovery.h \
     serialcontroller.h \
     cameramanager.h \
     trackingengine.h \
@@ -44,6 +46,7 @@ CONFIG(debug, debug|release) {
             -lopencv_highgui4120d \
             -lopencv_imgproc4120d \
             -lopencv_imgcodecs4120d \
+            -lopencv_videoio4120d \
             -lopencv_tracking4120d \
             -lopencv_features2d4120d \
             -lopencv_calib3d4120d \
@@ -55,6 +58,7 @@ CONFIG(debug, debug|release) {
             -lopencv_highgui4120 \
             -lopencv_imgproc4120 \
             -lopencv_imgcodecs4120 \
+            -lopencv_videoio4120 \
             -lopencv_tracking4120 \
             -lopencv_features2d4120 \
             -lopencv_calib3d4120 \

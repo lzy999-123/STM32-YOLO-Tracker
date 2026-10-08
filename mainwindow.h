@@ -4,6 +4,7 @@
 #include <QMainWindow>
 #include "serialcontroller.h"
 #include "cameramanager.h"
+#include "luckfoxdiscovery.h"
 #include "trackingengine.h"
 #include <QMouseEvent>
 #include <QPaintEvent>
@@ -13,6 +14,10 @@
 #include <QMutex>
 #include <QRect>
 #include <QCloseEvent>
+
+#include <atomic>
+#include <mutex>
+#include <thread>
 
 #include <opencv2/opencv.hpp>
 
@@ -61,6 +66,9 @@ private slots:
     
     /// @brief 接收底层摄像头传来的最新视频帧
     void handleNewVideoFrame(const QVideoFrame &frame);
+
+    /// @brief 接收直接解码的高性能 cv::Mat 视频帧（零内存拷贝）
+    void handleNewMatFrame(const cv::Mat &mat);
     
     /// @brief 对接收的视频帧进行真正的显示与逻辑处理
     void processLatestVideoFrame();
@@ -70,6 +78,10 @@ private slots:
     void on_btnStopTracking_clicked();          ///< 点击“停止追踪”按钮
     void on_pushButton_2_clicked();             ///< 串口云台测试/移动控制指令
     void on_pushButton_3_clicked();             ///< 串口云台测试/移动控制指令
+    void on_pushButton_4_clicked();             ///< 手动模式：向上步进
+    void on_pushButton_5_clicked();             ///< 手动模式：向左步进
+    void on_pushButton_6_clicked();             ///< 手动模式：向右步进
+    void on_pushButton_7_clicked();             ///< 手动模式：向下步进
     void onTrackingModelChanged(int index);     ///< 用户切换 YOLO 模型下拉框
 
 protected:
@@ -88,6 +100,24 @@ private:
     
     /// @brief 向串口发送命令字的内部包装方法
     void sendCommand(uint8_t cmd);
+
+    /// @brief 更新四个手动步进按钮的可用状态
+    void updateManualControlAvailability();
+
+    /// @brief 根据摄像头、串口、模式和追踪状态更新追踪按钮
+    void updateTrackingControlAvailability();
+
+    /// @brief 将特征跟踪帧交给独立线程，始终只保留最新帧
+    void dispatchTrackingFrame(const cv::Mat &frame);
+
+    /// @brief 等待后台特征跟踪帧处理结束
+    void waitForTrackingWorker();
+
+    /// @brief 安全停止跟踪，避免后台帧仍在访问引擎
+    void stopTrackingSafely();
+
+    /// @brief 执行一次固定 0.5° 的手动步进
+    void sendManualStep(uint8_t cmd, const QString &direction);
     
     /// @brief 获取 UI 上当前选中的模型文件名
     QString currentTrackingModelFileName() const;
@@ -101,11 +131,14 @@ private:
     Ui::MainWindow *ui;                      ///< UI 界面对象
     SerialController m_serialController;     ///< 串口控制器模块
     CameraManager m_cameraManager;           ///< 摄像头管理器模块
+    LuckfoxDiscovery m_luckfoxDiscovery;
     TrackingEngine m_trackingEngine;         ///< 目标追踪引擎核心模块
     
     cv::Mat m_lastFrame;                     ///< 转换后的 OpenCV 图像缓存
     QMutex m_pendingFrameMutex;              ///< 线程安全保护锁
     QVideoFrame m_pendingVideoFrame;         ///< 缓存未处理的最新的视频帧
+    cv::Mat m_pendingMat;                    ///< 缓存未处理的最新的 cv::Mat（用于 RTSP 高性能零拷贝通道）
+    bool m_hasPendingMat = false;            ///< 是否有待处理的 cv::Mat
     bool m_frameDispatchPending = false;     ///< 是否有待调度的视频帧
 
     bool m_isCapturing;                      ///< 摄像头是否正在取景中
@@ -141,8 +174,16 @@ private:
     int m_fpsFrameCount = 0;                 ///< 当前 FPS 窗口内帧数
     int m_displayedFps = 0;                  ///< 最近一次计算出的显示帧率
     qint64 m_lastInfoUpdateTime = 0;         ///< 追踪信息面板的节流时间戳
+    qint64 m_lastDisplayFrameTime = 0;      ///< 最近一次显示帧时间戳，限制界面最多 30 FPS
     int m_dnnFrameSkipCounter = 0;           ///< 跳帧计数器（降低刷新率）
     int m_lostFrameCount = 0;                ///< 丢失目标的持续帧数
+
+    // CSRT/ORB 更新可能超过一帧周期，不能阻塞 GUI 线程。这里采用单线程、最新帧覆盖策略。
+    std::mutex m_trackingWorkerMutex;
+    cv::Mat m_pendingTrackingFrame;
+    std::thread m_trackingWorker;
+    std::atomic<bool> m_trackingWorkerRunning{false};
+    void trackingWorkerLoop();
 };
 
 #endif // MAINWINDOW_H

@@ -2,16 +2,48 @@
 #include "ui_mainwindow.h"
 
 #include <QCameraDevice>
+#include <QComboBox>
 #include <QDateTime>
 #include <QMediaDevices>
 #include <QMessageBox>
 #include <QPainter>
 #include <QPen>
+#include <QPushButton>
+#include <QDoubleSpinBox>
 #include <QScopeGuard>
 #include <QSerialPortInfo>
 #include <QTimer>
 
 #include <algorithm>
+
+namespace {
+constexpr int kRealtimeWidth = 1280;
+constexpr int kRealtimeHeight = 720;
+
+QString selectedCameraSource(const QComboBox *comboBox)
+{
+    const int index = comboBox->currentIndex();
+    const QString editText = comboBox->currentText().trimmed();
+    if (index >= 0 && editText == comboBox->itemText(index)) {
+        return comboBox->itemData(index).toString();
+    }
+    return editText;
+}
+
+QString normalizedRtspSource(QString source)
+{
+    if (source.isEmpty() || source.startsWith(QStringLiteral("rtsp://"), Qt::CaseInsensitive)) {
+        return source;
+    }
+
+    source.prepend(QStringLiteral("rtsp://"));
+    const int authorityStart = source.indexOf(QStringLiteral("://")) + 3;
+    if (source.indexOf(QLatin1Char('/'), authorityStart) < 0) {
+        source.append(QStringLiteral("/live/0"));
+    }
+    return source;
+}
+}
 
 MainWindow::MainWindow(QWidget *parent)
     : QMainWindow(parent)
@@ -50,6 +82,17 @@ MainWindow::MainWindow(QWidget *parent)
     ui->LED1->setStyleSheet(QStringLiteral("background-color:red"));
     ui->pushButton_2->setEnabled(false);
     ui->pushButton_3->setEnabled(false);
+    // 手动步进固定为每次 0.5°，避免 UI 数值与下位机步进协议不一致。
+    ui->doubleSpinBox->setDecimals(2);
+    ui->doubleSpinBox->setRange(0.5, 0.5);
+    ui->doubleSpinBox->setSingleStep(0.5);
+    ui->doubleSpinBox->setValue(0.5);
+    ui->doubleSpinBox->setReadOnly(true);
+    for (QPushButton *button : {ui->pushButton_4, ui->pushButton_5,
+                                ui->pushButton_6, ui->pushButton_7}) {
+        button->setEnabled(false);
+        button->setToolTip(QStringLiteral("仅手动模式可用，每次转动 0.5°"));
+    }
     ui->label_11->setText(QStringLiteral("手动"));
     ui->label_11->setStyleSheet(QStringLiteral("color: black; font-size: 14px; font-weight: bold;"));
 
@@ -73,6 +116,7 @@ MainWindow::MainWindow(QWidget *parent)
         if (ui->plainTextEdit_2) {
             ui->plainTextEdit_2->appendPlainText(msg);
         }
+        updateTrackingControlAvailability();
     });
 
     // 串口链路状态信号（协议 v2）：断线/重连/下位机在线/命令失败
@@ -84,6 +128,8 @@ MainWindow::MainWindow(QWidget *parent)
         ui->lineEdit->setText(QStringLiteral("重连中..."));
         ui->pushButton_2->setEnabled(false);
         ui->pushButton_3->setEnabled(false);
+        updateManualControlAvailability();
+        updateTrackingControlAvailability();
     });
     connect(&m_serialController, &SerialController::reconnected, this, [this]() {
         ui->plainTextEdit_2->appendPlainText(QStringLiteral("【串口】自动重连成功"));
@@ -91,6 +137,8 @@ MainWindow::MainWindow(QWidget *parent)
         ui->lineEdit->setText(QStringLiteral("已连接"));
         ui->pushButton_2->setEnabled(true);
         ui->pushButton_3->setEnabled(true);
+        updateManualControlAvailability();
+        updateTrackingControlAvailability();
     });
     connect(&m_serialController, &SerialController::deviceOnlineChanged, this,
             [this](bool online) {
@@ -104,6 +152,8 @@ MainWindow::MainWindow(QWidget *parent)
             ui->label_11->setStyleSheet(
                 QStringLiteral("color: gray; font-size: 14px; font-weight: bold;"));
         }
+        updateManualControlAvailability();
+        updateTrackingControlAvailability();
     });
     connect(&m_serialController, &SerialController::commandFailed, this,
             [this](uint8_t cmd) {
@@ -122,27 +172,75 @@ MainWindow::MainWindow(QWidget *parent)
     m_trackingEngine.setCurrentModel(currentTrackingModelFileName());
 
     ui->comboBox_3->clear();
+    ui->comboBox_3->setEditable(true);
+
+    // 网线直连模式
+    ui->comboBox_3->addItem(QStringLiteral("【网线直连】Luckfox 原生720P@30主码流 (192.168.8.93)"),
+                            QStringLiteral("rtsp://192.168.8.93/live/0"));
+
+    // USB 直连模式（172.32.0.93，720P 极速零延迟）
+    ui->comboBox_3->addItem(QStringLiteral("【USB直连】Luckfox 原生720P@30主码流 (172.32.0.93)"),
+                            QStringLiteral("rtsp://172.32.0.93/live/0"));
+    ui->comboBox_3->addItem(QStringLiteral("【USB直连】Luckfox备用子码流 (当前实测704×576@30，不满足720P)"),
+                            QStringLiteral("rtsp://172.32.0.93/live/1"));
+
+    ui->comboBox_3->addItem(QStringLiteral("Luckfox 自动识别"),
+                            QStringLiteral("luckfox:auto"));
+
+    // 添加本地 USB 硬件摄像头
     QList<QCameraDevice> cameraDevices;
     try {
         cameraDevices = QMediaDevices::videoInputs();
     } catch (...) {
     }
 
-    if (cameraDevices.isEmpty()) {
-        ui->comboBox_3->addItem(QStringLiteral("未检测到摄像头"));
-        ui->comboBox_3->setEnabled(false);
-        ui->pushButton_9->setEnabled(false);
-    } else {
-        for (const QCameraDevice &device : cameraDevices) {
-            ui->comboBox_3->addItem(device.description(), device.id());
-        }
-        ui->pushButton_9->setText(QStringLiteral("打开摄像头"));
+    for (const QCameraDevice &device : cameraDevices) {
+        ui->comboBox_3->addItem(QStringLiteral("【本地免驱720P】") + device.description(),
+                                QString::fromUtf8(device.id()));
     }
+
+    // 默认通过设备发现获取热点当前分配的地址。
+    ui->comboBox_3->setCurrentIndex(3);
+    ui->comboBox_3->setEnabled(true);
+    ui->pushButton_9->setEnabled(true);
+    ui->pushButton_9->setText(QStringLiteral("打开摄像头"));
+
+    connect(&m_luckfoxDiscovery, &LuckfoxDiscovery::found, this, [this](const QString &url) {
+        ui->comboBox_3->setEnabled(true);
+        ui->plainTextEdit_2->appendPlainText(QStringLiteral("【摄像头】已找到 Luckfox：%1，正在连接...").arg(url));
+        m_cameraManager.openCamera(url);
+    });
+    connect(&m_luckfoxDiscovery, &LuckfoxDiscovery::failed, this, [this](const QString &message) {
+        ui->comboBox_3->setEnabled(true);
+        ui->pushButton_9->setText(QStringLiteral("打开摄像头"));
+        ui->pushButton_9->setEnabled(true);
+        ui->plainTextEdit_2->appendPlainText(QStringLiteral("【摄像头】%1").arg(message));
+    });
+
+    QPushButton *btnRotate = new QPushButton(this);
+    btnRotate->setGeometry(415, 380, 80, 31);
+    btnRotate->setText(QStringLiteral("画面: 正常"));
+    btnRotate->setToolTip(QStringLiteral("点击循环切换画面方向：正常 -> 180° -> 水平镜像 -> 垂直翻转 -> 90° -> 270°"));
+    connect(btnRotate, &QPushButton::clicked, this, [this, btnRotate]() {
+        int mode = static_cast<int>(m_cameraManager.rotationMode());
+        mode = (mode + 1) % 6;
+        m_cameraManager.setRotationMode(static_cast<CameraManager::RotationMode>(mode));
+        switch (mode) {
+            case 0: btnRotate->setText(QStringLiteral("画面: 正常")); break;
+            case 1: btnRotate->setText(QStringLiteral("画面: 180°")); break;
+            case 2: btnRotate->setText(QStringLiteral("画面: 水平")); break;
+            case 3: btnRotate->setText(QStringLiteral("画面: 垂直")); break;
+            case 4: btnRotate->setText(QStringLiteral("画面: 90°")); break;
+            case 5: btnRotate->setText(QStringLiteral("画面: 270°")); break;
+        }
+    });
 
     connect(ui->comboBox_3, QOverload<int>::of(&QComboBox::currentIndexChanged),
             this, &MainWindow::onCameraChanged);
     connect(&m_cameraManager, &CameraManager::frameReady,
             this, &MainWindow::handleNewVideoFrame);
+    connect(&m_cameraManager, &CameraManager::matReady,
+            this, &MainWindow::handleNewMatFrame);
     connect(&m_cameraManager, &CameraManager::stateChanged, this,
             [this](CameraManager::CameraState state) {
         if (state == CameraManager::CameraState::Idle) {
@@ -151,6 +249,9 @@ MainWindow::MainWindow(QWidget *parent)
         } else if (state == CameraManager::CameraState::Open) {
             ui->pushButton_9->setText(QStringLiteral("关闭摄像头"));
             ui->pushButton_9->setEnabled(true);
+            if (m_cameraManager.currentCameraId().startsWith(QStringLiteral("rtsp://"), Qt::CaseInsensitive)) {
+                ui->plainTextEdit_2->appendPlainText(QStringLiteral("【图像通道】RTSP 视频流已连接"));
+            }
         } else if (state == CameraManager::CameraState::Opening) {
             ui->pushButton_9->setText(QStringLiteral("正在打开..."));
             ui->pushButton_9->setEnabled(false);
@@ -161,23 +262,86 @@ MainWindow::MainWindow(QWidget *parent)
             ui->pushButton_9->setText(QStringLiteral("打开摄像头"));
             ui->pushButton_9->setEnabled(true);
         }
+        updateTrackingControlAvailability();
     });
     connect(&m_cameraManager, &CameraManager::cameraError, this, [this](const QString &errorMsg) {
         ui->plainTextEdit_2->appendPlainText(QStringLiteral("【摄像头】%1").arg(errorMsg));
         ui->pushButton_9->setText(QStringLiteral("打开摄像头"));
         ui->pushButton_9->setEnabled(true);
+        updateTrackingControlAvailability();
     });
     m_cameraManager.startChecking();
+    updateTrackingControlAvailability();
 }
 
 MainWindow::~MainWindow()
 {
-    m_trackingEngine.stopTracking();
+    m_luckfoxDiscovery.cancel();
+    stopTrackingSafely();
     m_cameraManager.closeCamera();
     if (m_serialController.isOpen()) {
         m_serialController.closeSerial();
     }
     delete ui;
+}
+
+void MainWindow::dispatchTrackingFrame(const cv::Mat &frame)
+{
+    if (frame.empty()) return;
+
+    std::unique_lock<std::mutex> lock(m_trackingWorkerMutex);
+    m_pendingTrackingFrame = frame;
+
+    if (m_trackingWorkerRunning.load(std::memory_order_acquire)) {
+        return;
+    }
+
+    if (m_trackingWorker.joinable()) {
+        lock.unlock();
+        m_trackingWorker.join();
+        lock.lock();
+    }
+
+    m_trackingWorkerRunning.store(true, std::memory_order_release);
+    m_trackingWorker = std::thread(&MainWindow::trackingWorkerLoop, this);
+}
+
+void MainWindow::trackingWorkerLoop()
+{
+    for (;;) {
+        cv::Mat frame;
+        {
+            std::lock_guard<std::mutex> lock(m_trackingWorkerMutex);
+            if (m_pendingTrackingFrame.empty()) {
+                m_trackingWorkerRunning.store(false, std::memory_order_release);
+                return;
+            }
+            frame = m_pendingTrackingFrame;
+            m_pendingTrackingFrame.release();
+        }
+
+        // CSRT/ORB 可能耗时数十毫秒，放在这里执行不会阻塞 Qt GUI 重绘。
+        m_trackingEngine.setFrameSize(QSize(frame.cols, frame.rows));
+        m_trackingEngine.processFrame(frame);
+    }
+}
+
+void MainWindow::waitForTrackingWorker()
+{
+    {
+        std::lock_guard<std::mutex> lock(m_trackingWorkerMutex);
+        m_pendingTrackingFrame.release();
+    }
+    if (m_trackingWorker.joinable()) {
+        m_trackingWorker.join();
+    }
+    m_trackingWorkerRunning.store(false, std::memory_order_release);
+}
+
+void MainWindow::stopTrackingSafely()
+{
+    waitForTrackingWorker();
+    m_trackingEngine.stopTracking();
 }
 
 QString MainWindow::currentTrackingModelFileName() const
@@ -218,7 +382,7 @@ void MainWindow::onTrackingModelChanged(int index)
     m_trackedRect = cv::Rect2d();
     m_offsetX = 0;
     m_offsetY = 0;
-    m_trackingEngine.stopTracking();
+    stopTrackingSafely();
     if (wasAutoTracking) {
         sendCommand(SerialController::CmdTrackOff);
     }
@@ -235,6 +399,7 @@ void MainWindow::onTrackingModelChanged(int index)
         m_trackingEngine.setTrackingBackend(false, modelFileName);
         m_trackingEngine.setCurrentModel(modelFileName);
     }
+    updateTrackingControlAvailability();
 }
 
 void MainWindow::testDNN()
@@ -266,6 +431,8 @@ void MainWindow::on_pushButton_clicked()
                 ui->plainTextEdit_4->setPlainText(QString::number(angle2, 'f', 1));
 
                 if (remoteMode == m_lastRemoteMode) {
+                    updateManualControlAvailability();
+                    updateTrackingControlAvailability();
                     return;
                 }
                 m_lastRemoteMode = remoteMode;
@@ -283,17 +450,21 @@ void MainWindow::on_pushButton_clicked()
                 }
 
                 m_isCapturing = false;
-                m_trackingEngine.stopTracking();
+                stopTrackingSafely();
                 m_trackedRect = cv::Rect2d();
                 m_isTargetTracked = false;
                 m_offsetX = 0;
                 m_offsetY = 0;
+                updateManualControlAvailability();
+                updateTrackingControlAvailability();
             });
 
             ui->pushButton->setText(QStringLiteral("关闭串口"));
             ui->LED1->setStyleSheet(QStringLiteral("background-color:green"));
             ui->pushButton_2->setEnabled(true);
             ui->pushButton_3->setEnabled(true);
+            updateManualControlAvailability();
+            updateTrackingControlAvailability();
             ui->plainTextEdit_2->appendPlainText(QStringLiteral("【串口】已连接，状态同步完成"));
         } else {
             ui->lineEdit->setText(QStringLiteral("串口打开失败！"));
@@ -308,6 +479,8 @@ void MainWindow::on_pushButton_clicked()
         m_lastRemoteMode = -1;
         ui->pushButton_2->setEnabled(false);
         ui->pushButton_3->setEnabled(false);
+        updateManualControlAvailability();
+        updateTrackingControlAvailability();
     }
 }
 
@@ -323,19 +496,95 @@ void MainWindow::on_pushButton_8_clicked()
 void MainWindow::onCameraChanged(int index)
 {
     if (index < 0) return;
-    if (m_cameraManager.state() == CameraManager::CameraState::Open) {
-        m_cameraManager.closeCamera();
-        m_cameraManager.openCamera(ui->comboBox_3->itemData(index).toString());
+    QString camId = ui->comboBox_3->itemData(index).toString();
+    if (camId == QStringLiteral("luckfox:auto")) {
+        if (m_cameraManager.state() == CameraManager::CameraState::Open ||
+            m_cameraManager.state() == CameraManager::CameraState::Opening) {
+            on_pushButton_9_clicked();
+        }
+        return;
+    }
+    if (camId.isEmpty()) {
+        camId = ui->comboBox_3->currentText().trimmed();
+        if (camId == ui->comboBox_3->itemText(index)) {
+            return;
+        }
+    }
+
+    if (camId == m_cameraManager.currentCameraId() && m_cameraManager.state() == CameraManager::CameraState::Open) {
+        return;
+    }
+
+    // 只有当摄像头处于打开或正在打开状态时，切换下拉框才自动平滑重连新流
+    if (m_cameraManager.state() == CameraManager::CameraState::Open ||
+        m_cameraManager.state() == CameraManager::CameraState::Opening) {
+
+        // 清理待处理残留帧，防止新旧不同分辨率画面交错闪烁
+        {
+            QMutexLocker locker(&m_pendingFrameMutex);
+            m_hasPendingMat = false;
+            m_pendingMat.release();
+            m_pendingVideoFrame = QVideoFrame();
+            m_frameDispatchPending = false;
+        }
+        m_lastFrame.release();
+
+        if (camId.contains("172.32.0.93")) {
+            ui->plainTextEdit_2->appendPlainText(QStringLiteral("【摄像头】切换 -> USB 直连模式（720P 零延迟极速引擎）"));
+        } else if (camId.startsWith("rtsp://", Qt::CaseInsensitive)) {
+            ui->plainTextEdit_2->appendPlainText(QStringLiteral("【摄像头】切换 -> RTSP 网络视频流模式（720P低延迟）"));
+        } else {
+            ui->plainTextEdit_2->appendPlainText(QStringLiteral("【摄像头】切换 -> 本地物理摄像头（720P 高帧率模式）"));
+        }
+
+        m_cameraManager.openCamera(camId);
     }
 }
 
 void MainWindow::on_pushButton_9_clicked()
 {
+    if (m_luckfoxDiscovery.isActive()) {
+        m_luckfoxDiscovery.cancel();
+        ui->comboBox_3->setEnabled(true);
+        ui->pushButton_9->setText(QStringLiteral("打开摄像头"));
+        ui->plainTextEdit_2->appendPlainText(QStringLiteral("【摄像头】已取消查找"));
+        return;
+    }
     if (m_cameraManager.state() == CameraManager::CameraState::Idle ||
         m_cameraManager.state() == CameraManager::CameraState::Error) {
         ui->pushButton_9->setText(QStringLiteral("正在打开..."));
         ui->pushButton_9->setEnabled(false);
-        m_cameraManager.openCamera(ui->comboBox_3->currentData().toString());
+
+        const QString source = selectedCameraSource(ui->comboBox_3);
+        if (source == QStringLiteral("luckfox:auto")) {
+            ui->comboBox_3->setEnabled(false);
+            ui->pushButton_9->setText(QStringLiteral("取消查找"));
+            ui->pushButton_9->setEnabled(true);
+            ui->plainTextEdit_2->appendPlainText(QStringLiteral("【摄像头】正在自动查找 Luckfox..."));
+            m_luckfoxDiscovery.start();
+            return;
+        }
+        const int selectedIndex = ui->comboBox_3->currentIndex();
+        const bool presetSelected = selectedIndex >= 0 &&
+            ui->comboBox_3->currentText().trimmed() == ui->comboBox_3->itemText(selectedIndex);
+        const QString camId = presetSelected ? source : normalizedRtspSource(source);
+        if (camId.isEmpty()) {
+            ui->pushButton_9->setText(QStringLiteral("打开摄像头"));
+            ui->pushButton_9->setEnabled(true);
+            QMessageBox::warning(this, QStringLiteral("提示"),
+                                 QStringLiteral("请输入 Luckfox 的 Wi-Fi IP 或 RTSP 地址。"));
+            return;
+        }
+
+        if (camId.contains("172.32.0.93")) {
+            ui->plainTextEdit_2->appendPlainText(QStringLiteral("【摄像头】识别为 USB 直连模式，启用 720P 零延迟极速引擎"));
+        } else if (camId.startsWith("rtsp://", Qt::CaseInsensitive)) {
+            ui->plainTextEdit_2->appendPlainText(QStringLiteral("【摄像头】识别为 RTSP 网络视频流，启用低缓冲取流"));
+        } else {
+            ui->plainTextEdit_2->appendPlainText(QStringLiteral("【摄像头】启用本地物理摄像头（锁定 720P 零延迟模式）"));
+        }
+
+        m_cameraManager.openCamera(camId);
         return;
     }
 
@@ -353,7 +602,7 @@ void MainWindow::on_pushButton_9_clicked()
     m_isSelecting = false;
     m_hasSelectedTarget = false;
     m_wasTrackingBeforeDisconn = false;
-    m_trackingEngine.stopTracking();
+    stopTrackingSafely();
     m_selectedRect = cv::Rect2d();
     m_trackedRect = cv::Rect2d();
     m_isTargetTracked = false;
@@ -400,7 +649,7 @@ QImage MainWindow::CvMatToQImage(const cv::Mat& mat)
             mat.cols,
             mat.rows,
             static_cast<qsizetype>(mat.step),
-            QImage::Format_BGR888).copy();
+            QImage::Format_BGR888); // 消除 .copy() 冗余深拷贝，实现零拷贝内存视图
     }
     if (mat.type() == CV_8UC1) {
         return QImage(
@@ -408,7 +657,7 @@ QImage MainWindow::CvMatToQImage(const cv::Mat& mat)
             mat.cols,
             mat.rows,
             static_cast<qsizetype>(mat.step),
-            QImage::Format_Grayscale8).copy();
+            QImage::Format_Grayscale8);
     }
     return QImage();
 }
@@ -433,13 +682,33 @@ void MainWindow::handleNewVideoFrame(const QVideoFrame &frame)
     }
 }
 
+void MainWindow::handleNewMatFrame(const cv::Mat &mat)
+{
+    if (mat.empty()) return;
+
+    bool shouldDispatch = false;
+    {
+        QMutexLocker locker(&m_pendingFrameMutex);
+        m_pendingMat = mat;
+        m_hasPendingMat = true;
+        if (!m_frameDispatchPending) {
+            m_frameDispatchPending = true;
+            shouldDispatch = true;
+        }
+    }
+
+    if (shouldDispatch) {
+        processLatestVideoFrame();
+    }
+}
+
 void MainWindow::processLatestVideoFrame()
 {
     const auto finishFrameDispatch = qScopeGuard([this]() {
         bool hasPendingFrame = false;
         {
             QMutexLocker locker(&m_pendingFrameMutex);
-            hasPendingFrame = m_pendingVideoFrame.isValid();
+            hasPendingFrame = m_hasPendingMat || m_pendingVideoFrame.isValid();
             if (!hasPendingFrame) {
                 m_frameDispatchPending = false;
             }
@@ -450,24 +719,55 @@ void MainWindow::processLatestVideoFrame()
         }
     });
 
-    QVideoFrame frame;
+    cv::Mat cvMat;
     {
         QMutexLocker locker(&m_pendingFrameMutex);
-        frame = m_pendingVideoFrame;
-        m_pendingVideoFrame = QVideoFrame();
+        if (m_hasPendingMat) {
+            cvMat = m_pendingMat;
+            m_hasPendingMat = false;
+        } else if (m_pendingVideoFrame.isValid()) {
+            QVideoFrame frame = m_pendingVideoFrame;
+            m_pendingVideoFrame = QVideoFrame();
+            try {
+                cvMat = QVideoFrameToCvMat(frame);
+                if (!cvMat.empty()) {
+                    const int rot = static_cast<int>(m_cameraManager.rotationMode());
+                    if (rot == 1) {
+                        cv::flip(cvMat, cvMat, -1);
+                    } else if (rot == 2) {
+                        cv::flip(cvMat, cvMat, 1);
+                    } else if (rot == 3) {
+                        cv::flip(cvMat, cvMat, 0);
+                    } else if (rot == 4) {
+                        cv::rotate(cvMat, cvMat, cv::ROTATE_90_CLOCKWISE);
+                    } else if (rot == 5) {
+                        cv::rotate(cvMat, cvMat, cv::ROTATE_90_COUNTERCLOCKWISE);
+                    }
+                }
+            } catch (...) {
+                return;
+            }
+        }
     }
 
-    if (m_cameraManager.state() != CameraManager::CameraState::Open || !frame.isValid()) return;
+    if (m_cameraManager.state() != CameraManager::CameraState::Open || cvMat.empty()) return;
 
-    cv::Mat cvMat;
-    try {
-        cvMat = QVideoFrameToCvMat(frame);
-    } catch (...) {
+    // 输入端可能高于 30 FPS。只处理最新帧，避免 UI 队列里积累旧画面（允许 50FPS 宽松上限，避免 30FPS 抖动误丢）
+    const qint64 frameNow = QDateTime::currentMSecsSinceEpoch();
+    if (m_lastDisplayFrameTime > 0 && frameNow - m_lastDisplayFrameTime < 20) {
         return;
     }
-    if (cvMat.empty()) return;
+    m_lastDisplayFrameTime = frameNow;
 
-    cv::flip(cvMat, cvMat, -1);
+    // 720P 极速约束：无论来自本地 USB 还是网络流，严格保障画面上限为 720P，全链路零负载延迟
+    if (cvMat.cols > kRealtimeWidth || cvMat.rows > kRealtimeHeight) {
+        const double scale = std::min(static_cast<double>(kRealtimeWidth) / cvMat.cols,
+                                      static_cast<double>(kRealtimeHeight) / cvMat.rows);
+        const int newW = cvRound(cvMat.cols * scale);
+        const int newH = cvRound(cvMat.rows * scale);
+        cv::resize(cvMat, cvMat, cv::Size(newW, newH), 0, 0, cv::INTER_LINEAR);
+    }
+
     {
         QMutexLocker locker(&m_frameSizeMutex);
         m_frameSize = QSize(cvMat.cols, cvMat.rows);
@@ -491,34 +791,34 @@ void MainWindow::processLatestVideoFrame()
         m_wasTrackingBeforeDisconn = false;
     }
 
-    m_trackingEngine.setFrameSize(QSize(cvMat.cols, cvMat.rows));
-    m_trackingEngine.processFrame(cvMat);
-    if (m_cameraManager.state() != CameraManager::CameraState::Open) return;
     m_lastFrame = cvMat;
 
-    const QImage img = CvMatToQImage(cvMat);
-    if (!img.isNull()) {
-        const QSize labelSize = ui->imageLabel->size();
-        if (labelSize.width() >= 50 && labelSize.height() >= 50) {
-            const QSize imageSize = img.size();
-            if (m_renderCanvas.size() != labelSize) {
-                m_renderCanvas = QPixmap(labelSize);
-            }
+    const QSize labelSize = ui->imageLabel->size();
+    if (labelSize.width() >= 50 && labelSize.height() >= 50) {
+        const QSize imageSize(cvMat.cols, cvMat.rows);
+        if (m_renderCanvas.size() != labelSize) {
+            m_renderCanvas = QPixmap(labelSize);
+        }
 
+        const QSize scaledImageSize = imageSize.scaled(labelSize, Qt::KeepAspectRatio);
+        const int xOffset = (labelSize.width() - scaledImageSize.width()) / 2;
+        const int yOffset = (labelSize.height() - scaledImageSize.height()) / 2;
+
+        // 关键优化：使用 OpenCV AVX2 高性能缩放替代 QPainter 大图慢速软渲染缩放
+        cv::Mat displayMat;
+        cv::resize(cvMat, displayMat, cv::Size(scaledImageSize.width(), scaledImageSize.height()), 0, 0, cv::INTER_LINEAR);
+        const QImage img = CvMatToQImage(displayMat);
+        if (!img.isNull()) {
             QPainter painter(&m_renderCanvas);
-            painter.setRenderHint(QPainter::Antialiasing, true);
-            painter.setRenderHint(QPainter::SmoothPixmapTransform, true);
+            // 视频画面是像素内容，抗锯齿只会增加每帧栅格绘制开销。
+            painter.setRenderHint(QPainter::Antialiasing, false);
             m_renderCanvas.fill(Qt::black);
+            painter.drawImage(QPoint(xOffset, yOffset), img);
 
-            const QSize scaledImageSize = imageSize.scaled(labelSize, Qt::KeepAspectRatio);
-            const int xOffset = (labelSize.width() - scaledImageSize.width()) / 2;
-            const int yOffset = (labelSize.height() - scaledImageSize.height()) / 2;
-            painter.drawImage(QRect(QPoint(xOffset, yOffset), scaledImageSize), img);
-
-            const double scaleX = static_cast<double>(scaledImageSize.width()) / imageSize.width();
-            const double scaleY = static_cast<double>(scaledImageSize.height()) / imageSize.height();
-            const int centerX = labelSize.width() / 2;
-            const int centerY = labelSize.height() / 2;
+        const double scaleX = static_cast<double>(scaledImageSize.width()) / imageSize.width();
+        const double scaleY = static_cast<double>(scaledImageSize.height()) / imageSize.height();
+        const int centerX = labelSize.width() / 2;
+        const int centerY = labelSize.height() / 2;
             constexpr int crossLength = 30;
 
             painter.setPen(QPen(Qt::red, 3));
@@ -584,6 +884,16 @@ void MainWindow::processLatestVideoFrame()
         }
     }
 
+    // YOLO 本身已经在 DnnThread 中异步执行；CSRT/ORB 的更新则交给单独线程，
+    // 否则 setPixmap 之后 GUI 仍会被同步跟踪计算挡住，屏幕实际重绘会继续延迟。
+    if (m_isCapturing && isFeatureTrackingSelected()) {
+        dispatchTrackingFrame(cvMat);
+    } else {
+        m_trackingEngine.setFrameSize(QSize(cvMat.cols, cvMat.rows));
+        m_trackingEngine.processFrame(cvMat);
+    }
+    if (m_cameraManager.state() != CameraManager::CameraState::Open) return;
+
     {
         QMutexLocker modeLocker(&m_modeMutex);
         if (m_serialController.isOpen() && m_currentMode == 1 && m_isTargetTracked) {
@@ -617,12 +927,23 @@ void MainWindow::processLatestVideoFrame()
 
 void MainWindow::on_btnSelectTarget_clicked()
 {
+    if (!m_serialController.isOpen()) {
+        QMessageBox::warning(this, QStringLiteral("提示"), QStringLiteral("请先连接串口！"));
+        return;
+    }
+    {
+        QMutexLocker locker(&m_modeMutex);
+        if (m_currentMode != 1) {
+            QMessageBox::warning(this, QStringLiteral("提示"), QStringLiteral("请先切换到自动模式！"));
+            return;
+        }
+    }
     if (m_cameraManager.state() != CameraManager::CameraState::Open) {
         QMessageBox::warning(this, QStringLiteral("提示"), QStringLiteral("请先打开摄像头！"));
         return;
     }
 
-    m_trackingEngine.stopTracking();
+    stopTrackingSafely();
     m_isCapturing = false;
     m_hasSelectedTarget = false;
     m_trackedRect = cv::Rect2d();
@@ -633,11 +954,23 @@ void MainWindow::on_btnSelectTarget_clicked()
     m_selectEnd = QPoint();
     m_selectStartImg = QPoint();
     m_selectEndImg = QPoint();
+    updateTrackingControlAvailability();
     ui->plainTextEdit_2->appendPlainText(QStringLiteral("【提示】正在框选，请在画面内拖动鼠标..."));
 }
 
 void MainWindow::on_btnStartTracking_clicked()
 {
+    if (!m_serialController.isOpen()) {
+        QMessageBox::warning(this, QStringLiteral("提示"), QStringLiteral("请先连接串口！"));
+        return;
+    }
+    {
+        QMutexLocker locker(&m_modeMutex);
+        if (m_currentMode != 1) {
+            QMessageBox::warning(this, QStringLiteral("提示"), QStringLiteral("请先切换到自动模式！"));
+            return;
+        }
+    }
     if (m_cameraManager.state() != CameraManager::CameraState::Open) {
         QMessageBox::warning(this, QStringLiteral("提示"), QStringLiteral("请先打开摄像头！"));
         return;
@@ -670,11 +1003,13 @@ void MainWindow::on_btnStartTracking_clicked()
     m_isCapturing = true;
     m_wasTrackingBeforeDisconn = true;
     m_lostFrameCount = 0;
+    waitForTrackingWorker();
     m_trackingEngine.startTracking(
         currentFrameClone,
         m_selectedRect,
         useFeatureTracking,
         useFeatureTracking ? QStringLiteral("feature") : currentTrackingModelFileName());
+    updateTrackingControlAvailability();
 
     if (ui->label_11->text() == QStringLiteral("自动")) {
         sendCommand(SerialController::CmdTrackOn);
@@ -693,11 +1028,12 @@ void MainWindow::on_btnStopTracking_clicked()
 
     m_isCapturing = false;
     m_wasTrackingBeforeDisconn = false;
-    m_trackingEngine.stopTracking();
+    stopTrackingSafely();
     m_trackedRect = cv::Rect2d();
     m_isTargetTracked = false;
     m_offsetX = 0;
     m_offsetY = 0;
+    updateTrackingControlAvailability();
 
     if (!currentFrameClone.empty()) {
         const QImage img = CvMatToQImage(currentFrameClone);
@@ -833,6 +1169,7 @@ void MainWindow::mouseReleaseEvent(QMouseEvent *event)
     m_selectedRect = cv::Rect2d(selectRect.x(), selectRect.y(), selectRect.width(), selectRect.height());
     m_hasSelectedTarget = true;
     m_lastSelectedRect = m_selectedRect;
+    updateTrackingControlAvailability();
 
     const int maxEdge = std::max(selectRect.width(), selectRect.height());
     if (maxEdge > 180) {
@@ -854,7 +1191,7 @@ void MainWindow::on_pushButton_2_clicked()
     QTimer::singleShot(100, this, [this]() { ui->pushButton_2->setEnabled(true); });
 
     m_isCapturing = false;
-    m_trackingEngine.stopTracking();
+    stopTrackingSafely();
     m_trackedRect = cv::Rect2d();
     m_isTargetTracked = false;
     m_hasSelectedTarget = false;
@@ -862,6 +1199,7 @@ void MainWindow::on_pushButton_2_clicked()
     m_offsetX = 0;
     m_offsetY = 0;
     sendCommand(SerialController::CmdCenter);
+    updateTrackingControlAvailability();
 }
 
 void MainWindow::on_pushButton_3_clicked()
@@ -871,28 +1209,140 @@ void MainWindow::on_pushButton_3_clicked()
         return;
     }
 
-    QMutexLocker locker(&m_modeMutex);
-    m_currentMode = !m_currentMode;
-    if (m_currentMode == 0) {
-        ui->label_11->setText(QStringLiteral("手动"));
-        ui->label_11->setStyleSheet(QStringLiteral("color: black; font-size: 14px; font-weight: bold;"));
-    } else {
-        ui->label_11->setText(QStringLiteral("自动"));
-        ui->label_11->setStyleSheet(QStringLiteral("color: red; font-size: 14px; font-weight: bold;"));
-    }
+    {
+        QMutexLocker locker(&m_modeMutex);
+        m_currentMode = !m_currentMode;
+        if (m_currentMode == 0) {
+            ui->label_11->setText(QStringLiteral("手动"));
+            ui->label_11->setStyleSheet(QStringLiteral("color: black; font-size: 14px; font-weight: bold;"));
+        } else {
+            ui->label_11->setText(QStringLiteral("自动"));
+            ui->label_11->setStyleSheet(QStringLiteral("color: red; font-size: 14px; font-weight: bold;"));
+        }
 
-    m_isCapturing = false;
-    m_trackingEngine.stopTracking();
-    m_trackedRect = cv::Rect2d();
-    m_isTargetTracked = false;
-    m_hasSelectedTarget = false;
-    m_isSelecting = false;
-    m_offsetX = 0;
-    m_offsetY = 0;
-    sendCommand(SerialController::CmdSwitchMode);
+        m_isCapturing = false;
+        stopTrackingSafely();
+        m_trackedRect = cv::Rect2d();
+        m_isTargetTracked = false;
+        m_hasSelectedTarget = false;
+        m_isSelecting = false;
+        m_offsetX = 0;
+        m_offsetY = 0;
+        sendCommand(SerialController::CmdSwitchMode);
+    }
+    updateManualControlAvailability();
 
     ui->pushButton_3->setEnabled(false);
     QTimer::singleShot(100, this, [this]() { ui->pushButton_3->setEnabled(true); });
+}
+
+void MainWindow::updateManualControlAvailability()
+{
+    bool manual = false;
+    {
+        QMutexLocker locker(&m_modeMutex);
+        manual = (m_currentMode == 0);
+    }
+
+    // 遥测离线时 label_11 会显示“离线”，此时不允许误发手动步进命令。
+    const bool enabled = m_serialController.isOpen() && manual &&
+                         ui->label_11->text() == QStringLiteral("手动");
+    for (QPushButton *button : {ui->pushButton_4, ui->pushButton_5,
+                                ui->pushButton_6, ui->pushButton_7}) {
+        button->setEnabled(enabled);
+    }
+}
+
+void MainWindow::updateTrackingControlAvailability()
+{
+    const bool cameraReady =
+        m_cameraManager.state() == CameraManager::CameraState::Open;
+
+    bool autoMode = false;
+    {
+        QMutexLocker locker(&m_modeMutex);
+        autoMode = (m_currentMode == 1);
+    }
+
+    const bool serialReady = m_serialController.isOpen();
+    const bool modelReady = isFeatureTrackingSelected() ||
+                            (m_trackingEngine.yoloReady() &&
+                             m_trackingEngine.yoloWarmedUp());
+
+    // 追踪属于自动模式功能；停止按钮保留给当前追踪状态，便于串口异常时先停止本地线程。
+    const bool canSelect = cameraReady && serialReady && autoMode &&
+                           !m_isCapturing && !m_isSelecting;
+    const bool canStart = cameraReady && serialReady && autoMode &&
+                          m_hasSelectedTarget && !m_isCapturing && modelReady;
+    const bool canStop = m_isCapturing;
+
+    ui->btnSelectTarget->setEnabled(canSelect);
+    ui->btnStartTracking->setEnabled(canStart);
+    ui->btnStopTracking->setEnabled(canStop);
+
+    if (!cameraReady) {
+        ui->btnSelectTarget->setToolTip(QStringLiteral("请先打开摄像头"));
+        ui->btnStartTracking->setToolTip(QStringLiteral("请先打开摄像头"));
+    } else if (!serialReady) {
+        ui->btnSelectTarget->setToolTip(QStringLiteral("请先连接串口"));
+        ui->btnStartTracking->setToolTip(QStringLiteral("请先连接串口"));
+    } else if (!autoMode) {
+        ui->btnSelectTarget->setToolTip(QStringLiteral("自动模式下才能进行目标追踪"));
+        ui->btnStartTracking->setToolTip(QStringLiteral("自动模式下才能开始追踪"));
+    } else if (!m_hasSelectedTarget) {
+        ui->btnStartTracking->setToolTip(QStringLiteral("请先选择目标"));
+    } else if (!modelReady) {
+        ui->btnStartTracking->setToolTip(QStringLiteral("追踪模型尚未准备好"));
+    } else {
+        ui->btnSelectTarget->setToolTip(QStringLiteral("在画面中框选目标"));
+        ui->btnStartTracking->setToolTip(QStringLiteral("开始自动追踪"));
+    }
+    ui->btnStopTracking->setToolTip(canStop ? QStringLiteral("停止当前追踪")
+                                            : QStringLiteral("当前没有正在进行的追踪"));
+}
+
+void MainWindow::sendManualStep(uint8_t cmd, const QString &direction)
+{
+    bool manual = false;
+    {
+        QMutexLocker locker(&m_modeMutex);
+        manual = (m_currentMode == 0);
+    }
+
+    if (!m_serialController.isOpen()) {
+        QMessageBox::warning(this, QStringLiteral("提示"), QStringLiteral("请先连接串口！"));
+        return;
+    }
+    if (!manual || ui->label_11->text() != QStringLiteral("手动")) {
+        ui->plainTextEdit_2->appendPlainText(QStringLiteral("【手动控制】当前不是手动模式，忽略%1操作").arg(direction));
+        updateManualControlAvailability();
+        return;
+    }
+
+    // 下位机收到一个命令只改变一次目标角度，固定为 0.5°。
+    sendCommand(cmd);
+    ui->plainTextEdit_2->appendPlainText(
+        QStringLiteral("【手动控制】%1 0.5°").arg(direction));
+}
+
+void MainWindow::on_pushButton_4_clicked()
+{
+    sendManualStep(SerialController::CmdManualUp, QStringLiteral("向上"));
+}
+
+void MainWindow::on_pushButton_5_clicked()
+{
+    sendManualStep(SerialController::CmdManualLeft, QStringLiteral("向左"));
+}
+
+void MainWindow::on_pushButton_6_clicked()
+{
+    sendManualStep(SerialController::CmdManualRight, QStringLiteral("向右"));
+}
+
+void MainWindow::on_pushButton_7_clicked()
+{
+    sendManualStep(SerialController::CmdManualDown, QStringLiteral("向下"));
 }
 
 void MainWindow::sendCommand(uint8_t cmd)
@@ -902,7 +1352,7 @@ void MainWindow::sendCommand(uint8_t cmd)
 
 void MainWindow::closeEvent(QCloseEvent *event)
 {
-    m_trackingEngine.stopTracking();
+    stopTrackingSafely();
     if (m_serialController.isOpen()) {
         // 发送停止跟踪+回中并等待字节写出；即使丢包，下位机链路超时保护也会兜底回中
         m_serialController.shutdownGimbal();

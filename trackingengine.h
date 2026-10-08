@@ -6,6 +6,7 @@
 #include <QSize>
 #include <QHash>
 #include <QString>
+#include <mutex>
 #include <opencv2/opencv.hpp>
 #include <opencv2/tracking.hpp>
 #include <opencv2/features2d.hpp>
@@ -208,6 +209,7 @@ private:
     bool restartFeatureTrackerFromRect(const cv::Mat &frame, const cv::Rect &target, const QString &methodName);
 
 private:
+    mutable std::recursive_mutex m_stateMutex;
     cv::Size m_frameSize;                 ///< 记录视频画面尺寸
     bool m_useFeatureTracking = false;    ///< 当前是否在用特征追踪模式
     QString m_currentModelName;           ///< 当前选用的 YOLO 模型名称
@@ -231,6 +233,7 @@ private:
     cv::Mat m_featureReferenceDescriptors; ///< 目标关键点描述子
     cv::Size m_featureReferenceSize;      ///< 目标初始大小
     cv::Rect2d m_featureLastRect;         ///< 上一帧的目标位置
+    qint64 m_lastFeatureRecoveryAttemptTime = 0; ///< 上次执行重捕搜索的时间
     cv::Rect2d m_featureRecoveryCandidateRect; 
     QString m_featureRecoveryCandidateMethod; 
     int m_featureUnreliableCount = 0;     ///< 结果不可靠计数器（应对追踪漂移）

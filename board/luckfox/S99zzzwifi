@@ -1,0 +1,58 @@
+#!/bin/sh
+load_module() {
+    [ -d "/sys/module/$1" ] || insmod "$2"
+}
+load_wifi() {
+    helper=$(cat /proc/sys/kernel/modprobe)
+    trap 'echo "$helper" > /proc/sys/kernel/modprobe' EXIT HUP INT TERM
+    echo /bin/true > /proc/sys/kernel/modprobe
+    for module in libaes aes_generic ctr ccm; do
+        load_module "$module" "/oem/usr/ko/$module.ko" || return 1
+    done
+    load_module lib80211 /userdata/wifi-driver/lib80211.ko || return 1
+    load_module lib80211_crypt_ccmp /userdata/wifi-driver/lib80211_crypt_ccmp.ko || return 1
+    echo "$helper" > /proc/sys/kernel/modprobe
+    load_module cfg80211 /oem/usr/ko/cfg80211.ko || return 1
+    load_module libarc4 /oem/usr/ko/libarc4.ko || return 1
+    load_module lib80211_crypt_wep /userdata/wifi-driver/lib80211_crypt_wep.ko || return 1
+    if [ ! -d /sys/module/r8188eu ]; then
+        insmod /userdata/wifi-driver/r8188eu.ko rtw_power_mgnt=0 rtw_enusbss=0 rtw_ips_mode=0 || return 1
+    fi
+    ip link set wlan0 up || return 1
+    mkdir -p /var/run/wpa_supplicant
+    if ! wpa_cli -i wlan0 ping 2>/dev/null | grep -q PONG; then
+        rm -f /var/run/wpa_supplicant/wlan0
+        nohup wpa_supplicant -i wlan0 -D wext -c /userdata/cfg/wpa_supplicant.conf -C /var/run/wpa_supplicant >/tmp/luckfox-wpa.log 2>&1 </dev/null &
+    fi
+    attempt=0
+    while [ "$attempt" -lt 40 ]; do
+        wpa_cli -i wlan0 status 2>/dev/null | grep -q 'wpa_state=COMPLETED' && break
+        attempt=$((attempt + 1))
+        sleep 1
+    done
+    wpa_cli -i wlan0 status 2>/dev/null | grep -q 'wpa_state=COMPLETED' || return 1
+    # The camera service restarts DHCP clients when Wi-Fi first connects.
+    sleep 15
+    for pid in $(ps | awk '/[u]dhcpc.*-i eth0/ {print $1}'); do
+        kill "$pid" 2>/dev/null
+    done
+    ifconfig eth0 192.168.8.93 netmask 255.255.255.0 up
+    if ! ps | grep '[u]dhcpc.*wlan0' >/dev/null; then
+        nohup udhcpc -f -i wlan0 -p /var/run/udhcpc-wlan0.pid -t 5 -T 3 >/tmp/luckfox-wifi-dhcp.log 2>&1 </dev/null &
+        sleep 1
+    fi
+    echo "Wi-Fi authenticated; DHCP started"
+}
+case "$1" in
+start)
+    (sleep 35; load_wifi) >/tmp/luckfox-wifi-start.log 2>&1 &
+    ;;
+test) load_wifi ;;
+stop)
+    wpa_cli -i wlan0 terminate >/dev/null 2>&1
+    if [ -f /var/run/udhcpc-wlan0.pid ]; then
+        kill "$(cat /var/run/udhcpc-wlan0.pid)" 2>/dev/null
+    fi
+    ;;
+*) exit 1 ;;
+esac

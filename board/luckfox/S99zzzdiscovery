@@ -1,0 +1,15 @@
+#!/bin/sh
+case "$1" in
+start)
+    if [ -f /var/run/luckfox-discovery.pid ] && kill -0 "$(cat /var/run/luckfox-discovery.pid)" 2>/dev/null; then
+        exit 0
+    fi
+    nohup /usr/bin/python3 /oem/usr/bin/luckfox-discovery.py >/tmp/luckfox-discovery.log 2>&1 </dev/null &
+    echo $! > /var/run/luckfox-discovery.pid
+    sleep 1
+    ;;
+stop)
+    [ ! -f /var/run/luckfox-discovery.pid ] || kill "$(cat /var/run/luckfox-discovery.pid)" 2>/dev/null
+    ;;
+*) exit 1 ;;
+esac

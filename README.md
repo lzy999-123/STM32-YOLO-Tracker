@@ -19,6 +19,17 @@
 *   `serialcontroller.cpp/h`：串口通信封装模块。
 
 ## 部署说明
+
+最新阶段进展和验证范围见 [2026-10-08 阶段记录](MILESTONE_2026-10-08.md)。
+
+### Luckfox 无线摄像头
+
+电脑连接与 Luckfox 相同的热点，保持默认的“Luckfox 自动识别”，点击“打开摄像头”即可。
+上位机会自动发现板子的当前地址并打开 `/live/0`，无需填写 IP；查找时可点击“取消查找”。
+板子刚上电需要约一分钟完成 Wi-Fi 连接。网线和 USB 直连仍可从下拉框选择。
+设备发现由板子 `/etc/init.d/S99zzzdiscovery` 自动启动，使用 UDP 39093。
+板子部署和驱动修复脚本见 [board/luckfox](board/luckfox/README.md)。
+
 1.  环境准备：需安装 Qt 并在 `.pro` 中配置好 OpenCV 及 SerialPort。
 2.  模型文件：由于体积较大，YOLO26 的 `.onnx` / `.pt` 模型文件不直接包含在代码库中，请根据需要自行放置到项目对应目录。默认文件名为 `yolo26s.onnx` / `yolo26n.onnx`。
 3.  编译运行：通过 Qt Creator 打开 `.pro` 工程文件，构建并运行。

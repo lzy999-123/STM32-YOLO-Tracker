@@ -28,6 +28,10 @@ public:
         CmdCenter     = 0x02, ///< 回中并停止跟踪
         CmdTrackOn    = 0x11, ///< 使能自动跟踪
         CmdTrackOff   = 0x12, ///< 停止自动跟踪
+        CmdManualUp   = 0x20, ///< 手动模式：垂直轴向上步进 0.5°
+        CmdManualDown = 0x21, ///< 手动模式：垂直轴向下步进 0.5°
+        CmdManualLeft = 0x22, ///< 手动模式：水平轴向左步进 0.5°
+        CmdManualRight = 0x23, ///< 手动模式：水平轴向右步进 0.5°
     };
 
     explicit SerialController(QObject *parent = nullptr);

@@ -27,6 +27,7 @@ constexpr double kFeatureYoloRecoverMinColorSimilarity = 0.08;
 constexpr double kFeatureYoloRecoverMinCombinedScore = 0.24;
 constexpr int kFeatureRecoveryConfirmFrames = 1;
 constexpr qint64 kFeatureYoloRecoveryIntervalMs = 100;
+constexpr qint64 kFeatureRecoveryIntervalMs = 80;
 constexpr qint64 kFeatureRecoveryStrategyLogIntervalMs = 1800;
 constexpr int kFeatureCompareMaxSide = 160;
 constexpr double kColorRecoverThreshold = 1.10;
@@ -139,6 +140,7 @@ cv::Rect TrackingEngine::boundedIntRect(const cv::Rect2d &rect, const cv::Size &
 }
 
 void TrackingEngine::onDnnResultReceived(const cv::Rect2d &dnnRect, bool success, const QString &className) {
+    std::lock_guard<std::recursive_mutex> stateLock(m_stateMutex);
     if (!m_isCapturing) return;
 
     QString resultName = className;
@@ -252,6 +254,7 @@ void TrackingEngine::onYoloDetectionResult(
     quint64 requestId,
     bool finished)
 {
+    std::lock_guard<std::recursive_mutex> stateLock(m_stateMutex);
     if (m_featureYoloClassifyPending &&
         requestId == m_featureYoloClassifyRequestId &&
         !m_featureYoloClassifyFrame.empty()) {
@@ -501,7 +504,8 @@ DnnThread *TrackingEngine::ensureDnnThread(const QString &modelFileName)
         emit logMessage(
             QString(success ? "【系统】%1" : "【警告】%1").arg(message));
     });
-    thread->start(QThread::LowPriority);
+    // 推理结果直接影响云台控制，低优先级会在相机/UI繁忙时增加结果年龄。
+    thread->start(QThread::NormalPriority);
     return thread;
 }
 
@@ -515,6 +519,7 @@ void TrackingEngine::resetFeatureTracker()
     m_featureReferenceDescriptors.release();
     m_featureReferenceSize = cv::Size();
     m_featureLastRect = cv::Rect2d();
+    m_lastFeatureRecoveryAttemptTime = 0;
     resetFeatureRecoveryCandidate();
     m_featureUnreliableCount = 0;
 }
@@ -632,6 +637,14 @@ bool TrackingEngine::recoverFeatureTracker(const cv::Mat &frame)
     if (frame.empty()) {
         return false;
     }
+
+    // 丢帧期间不要在每一张画面上重复执行整幅 ORB/多尺度模板搜索。
+    // 这些搜索在主线程中运行，连续触发会把相机帧和界面一起拖住。
+    const qint64 now = QDateTime::currentMSecsSinceEpoch();
+    if (now - m_lastFeatureRecoveryAttemptTime < kFeatureRecoveryIntervalMs) {
+        return false;
+    }
+    m_lastFeatureRecoveryAttemptTime = now;
 
     auto logRecoveryStrategy = [this](const QString &message) {
         const qint64 now = QDateTime::currentMSecsSinceEpoch();
@@ -1468,34 +1481,41 @@ bool TrackingEngine::restartFeatureTrackerFromRect(const cv::Mat &frame, const c
 
 
 void TrackingEngine::init(const QSize &frameSize) {
+    std::lock_guard<std::recursive_mutex> stateLock(m_stateMutex);
     m_frameSize = cv::Size(frameSize.width(), frameSize.height());
 }
 
 void TrackingEngine::setFrameSize(const QSize &size) {
+    std::lock_guard<std::recursive_mutex> stateLock(m_stateMutex);
     m_frameSize = cv::Size(size.width(), size.height());
 }
 
 void TrackingEngine::setCurrentModel(const QString &modelFileName)
 {
+    std::lock_guard<std::recursive_mutex> stateLock(m_stateMutex);
     restartDnnThread(modelFileName);
 }
 
 bool TrackingEngine::yoloReady() const
 {
+    std::lock_guard<std::recursive_mutex> stateLock(m_stateMutex);
     return m_dnnThread && !m_dnnThread->isNetEmpty();
 }
 
 bool TrackingEngine::yoloWarmedUp() const
 {
+    std::lock_guard<std::recursive_mutex> stateLock(m_stateMutex);
     return m_dnnThread && m_dnnThread->isWarmedUp();
 }
 
 void TrackingEngine::setTrackingBackend(bool useFeatureTracking, const QString &modelFileName) {
+    std::lock_guard<std::recursive_mutex> stateLock(m_stateMutex);
     m_useFeatureTracking = useFeatureTracking;
     m_currentModelName = modelFileName;
 }
 
 void TrackingEngine::startTracking(const cv::Mat &frame, const cv::Rect2d &targetRect, bool useFeatureTracking, const QString &modelFileName) {
+    std::lock_guard<std::recursive_mutex> stateLock(m_stateMutex);
     m_useFeatureTracking = useFeatureTracking;
     m_currentModelName = modelFileName;
     m_selectedRect = targetRect;
@@ -1524,6 +1544,7 @@ void TrackingEngine::startTracking(const cv::Mat &frame, const cv::Rect2d &targe
 }
 
 void TrackingEngine::stopTracking() {
+    std::lock_guard<std::recursive_mutex> stateLock(m_stateMutex);
     m_isCapturing = false;
     m_lostFrameCount = 0;
     if (m_dnnThread) m_dnnThread->stopDnn();
@@ -1536,25 +1557,23 @@ void TrackingEngine::stopTracking() {
 }
 
 void TrackingEngine::processFrame(const cv::Mat &frame) {
+    std::lock_guard<std::recursive_mutex> stateLock(m_stateMutex);
     if (!m_isCapturing) return;
     
     if (m_useFeatureTracking) {
         if (!updateFeatureTracker(frame)) {
-            if (!recoverFeatureTracker(frame)) {
-                m_lostFrameCount++;
-                if (m_lostFrameCount > 0) {
-                    m_isTargetTracked = false;
-                    m_offsetX = 0;
-                    m_offsetY = 0;
-                    if (m_lostFrameCount == 1) {
-                        emit logMessage("【警告】目标丢失！已清除追踪框，正在尝试找回...");
-                    }
-                    m_trackedRect = cv::Rect2d();
-                    emit targetLost();
+            // updateFeatureTracker 已经负责发起一次重捕；这里不要再次重捕，
+            // 否则同一帧会重复执行整幅搜索。
+            m_lostFrameCount++;
+            if (m_lostFrameCount > 0) {
+                m_isTargetTracked = false;
+                m_offsetX = 0;
+                m_offsetY = 0;
+                if (m_lostFrameCount == 1) {
+                    emit logMessage("【警告】目标丢失！已清除追踪框，正在尝试找回...");
                 }
-            } else {
-                m_isTargetTracked = true;
-                m_lostFrameCount = 0;
+                m_trackedRect = cv::Rect2d();
+                emit targetLost();
             }
         } else {
             m_isTargetTracked = true;
@@ -1592,9 +1611,24 @@ void TrackingEngine::processFrame(const cv::Mat &frame) {
     }
 }
 
-bool TrackingEngine::isTracking() const { return m_isTargetTracked; }
-cv::Rect2d TrackingEngine::currentTrackedRect() const { return m_trackedRect; }
-int TrackingEngine::currentOffsetX() const { return m_offsetX; }
-int TrackingEngine::currentOffsetY() const { return m_offsetY; }
-bool TrackingEngine::isFeatureTrackingSelected() const { return m_useFeatureTracking; }
+bool TrackingEngine::isTracking() const {
+    std::lock_guard<std::recursive_mutex> stateLock(m_stateMutex);
+    return m_isTargetTracked;
+}
+cv::Rect2d TrackingEngine::currentTrackedRect() const {
+    std::lock_guard<std::recursive_mutex> stateLock(m_stateMutex);
+    return m_trackedRect;
+}
+int TrackingEngine::currentOffsetX() const {
+    std::lock_guard<std::recursive_mutex> stateLock(m_stateMutex);
+    return m_offsetX;
+}
+int TrackingEngine::currentOffsetY() const {
+    std::lock_guard<std::recursive_mutex> stateLock(m_stateMutex);
+    return m_offsetY;
+}
+bool TrackingEngine::isFeatureTrackingSelected() const {
+    std::lock_guard<std::recursive_mutex> stateLock(m_stateMutex);
+    return m_useFeatureTracking;
+}
 

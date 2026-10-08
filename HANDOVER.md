@@ -24,6 +24,13 @@
 | `serialcontroller.cpp` | 重写。CRC8(poly 0x07/init 0x00)、逐字节重同步解析、200ms 心跳、命令 ACK 队列（150ms 超时×3 重传）、`errorOccurred` 断线检测 + 2s 自动重连、遥测 1s 超时判下位机在线 |
 | `mainwindow.cpp` | 构造函数连接上述 4 个新信号（断线→LED 黄/按钮置灰，重连→恢复，离线→label_11 显示"离线"，命令失败→日志）；telemetry lambda 改新签名并格式化角度显示；`closeEvent` 改用 `shutdownGimbal()`；命令魔数全部替换为 `SerialController::Cmd*` 枚举 |
 
+### 手动模式步进扩展（2026-08-21）
+
+上位机四个方向按钮现通过 `CMD` 单字节命令 `0x20~0x23` 控制下位机手动步进，每次固定
+改变 0.5°；按钮仅在遥测确认的手动模式下启用。下位机 `Core/Src/main_gimbal.c` 对这四个命令
+在手动模式执行目标角度步进，在自动模式仅回 ACK、不改变目标角度。两侧代码和 `PROTOCOL.md`
+必须同步烧录/部署，否则新按钮命令不会生效。
+
 ### 下位机（已编译验证：Keil V5.06，0 Error 0 Warning）
 
 当前协议实现位于 `Core/Src/main_gimbal.c`；原 `main.c` 不参与当前目标构建。

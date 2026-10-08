@@ -731,28 +731,34 @@ void DnnThread::run() {
                 }
             }
 
-            QMutexLocker locker(&m_mutex);
-            if (best_idx != -1 &&
-                best_idx < static_cast<int>(classIds.size()) &&
-                classIds[best_idx] >= 0 &&
-                boxes[best_idx].width > 0 &&
-                boxes[best_idx].height > 0) {
-                m_lockedClassId = classIds[best_idx];
-                m_dnnMissCount = 0;
-                m_useYolo = true;
-                const cv::Rect bestBox = boxes[best_idx] & cv::Rect(0, 0, processFrame.cols, processFrame.rows);
-                m_lastYoloRect = boundedRect(
-                    cv::Rect2d(bestBox.x, bestBox.y, bestBox.width, bestBox.height),
-                    processFrame.size());
-
-                QString cName = yoloClassName(m_lockedClassId, m_classNames);
-                emit dnnTrackedResult(m_lastYoloRect, true, "LOCK:" + cName); // 特殊前缀用于触发锁定日志
-            } else {
-                m_useYolo = false;
-                m_lockedClassId = -1;
-                // 如果用户框选的地方真的没有任何 YOLO 目标，立刻通知 UI 丢失
-                emit dnnTrackedResult(cv::Rect2d(), false, "");
+            cv::Rect2d resultRect;
+            QString resultName;
+            bool success = false;
+            {
+                QMutexLocker locker(&m_mutex);
+                if (best_idx != -1 &&
+                    best_idx < static_cast<int>(classIds.size()) &&
+                    classIds[best_idx] >= 0 &&
+                    boxes[best_idx].width > 0 &&
+                    boxes[best_idx].height > 0) {
+                    m_lockedClassId = classIds[best_idx];
+                    m_dnnMissCount = 0;
+                    m_useYolo = true;
+                    const cv::Rect bestBox = boxes[best_idx] & cv::Rect(0, 0, processFrame.cols, processFrame.rows);
+                    m_lastYoloRect = boundedRect(
+                        cv::Rect2d(bestBox.x, bestBox.y, bestBox.width, bestBox.height),
+                        processFrame.size());
+                    resultRect = m_lastYoloRect;
+                    resultName = QStringLiteral("LOCK:") + yoloClassName(m_lockedClassId, m_classNames);
+                    success = true;
+                } else {
+                    m_useYolo = false;
+                    m_lockedClassId = -1;
+                }
             }
+            // 引擎回调会获取状态锁；持有输入锁发信号会与 processFrame/stopDnn
+            // 的 state -> input 顺序相反。成功与失败结果都必须在解锁后发出。
+            emit dnnTrackedResult(resultRect, success, resultName);
         } else if (doUpdate) {
             bool currentlyTracking = false;
             bool useYolo = false;

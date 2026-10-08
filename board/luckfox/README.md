@@ -10,6 +10,8 @@
 | S99zzzwifi | /etc/init.d/S99zzzwifi |
 | S99zzzdiscovery | /etc/init.d/S99zzzdiscovery |
 | luckfox-discovery.py | /oem/usr/bin/luckfox-discovery.py |
+| luckfox-control.py | /oem/usr/bin/luckfox-control.py |
+| S99zzzcontrol | /etc/init.d/S99zzzcontrol |
 
 两个启动脚本需要可执行权限。发现服务使用板子现有的Python 3和UDP 39093；Qt收到回应后连接回应源地址的RTSP `/live/0`。
 Wi-Fi脚本读取板子已有的 `/userdata/cfg/wpa_supplicant.conf`；仓库不保存热点密码。
@@ -37,3 +39,16 @@ Wi-Fi脚本读取板子已有的 `/userdata/cfg/wpa_supplicant.conf`；仓库不
 实际已运行的主驱动没有在crypto.h对齐修正后再次重编，修正后的CCMP依赖与该主驱动组合已通过无线视频及重启验证。
 
 完整证据摘要见根目录 `WIFI_DRIVER_HANDOFF.md` 和 `MILESTONE_2026-10-08.md`。
+
+## 无线云台转发
+
+新增 UDP 5005 控制服务，将电脑发来的坐标/指令转换成 STM32 UART 协议，并回传遥测和实际 ACK。
+
+当前 Pico Plus 接线使用 UART2_M1：GPIO1_B2/TX → STM32 PA3/RX，GPIO1_B3/RX ← PA2/TX，共地。
+实机已释放 FIQ 控制台并启用 `/dev/ttyS2`；配置样例见 `luckfox-control.example.json`，参考 DT 片段见 `uart2-stm32-overlay.dts`。
+服务支持 `start/stop/restart/status`，日志位于 `/tmp/luckfox-control.log`。
+只使用标准库并以 `python3 -S` 启动，避免小内存板子承担不必要的模块开销。
+目前已确认 STM32 遥测、指令 ACK 和模式切换；用户尚未接入云台，运动闭环仍待验收。
+部署与当前 UART 启用限制见根目录 [无线控制说明](../../WIRELESS_CONTROL.md)。
+`/userdata/cfg/luckfox-control.json` 必须使用确认后的实际 UART；配置缺失时不启动服务。
+网络命令按请求编号去重，UART 非幂等命令不盲目重发；断网时停止控制并停止 UART 心跳。

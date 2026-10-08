@@ -1,4 +1,4 @@
-QT       += core gui network serialport  multimedia multimediawidgets widgets
+QT       += core gui network concurrent multimedia multimediawidgets widgets
 
 greaterThan(QT_MAJOR_VERSION, 4): QT += widgets
 
@@ -8,7 +8,8 @@ SOURCES += \
     main.cpp \
     luckfoxdiscovery.cpp \
     mainwindow.cpp \
-    serialcontroller.cpp \
+    networkcontroller.cpp \
+    hostwifimonitor.cpp \
     cameramanager.cpp \
     trackingengine.cpp \
     dnnthread.cpp
@@ -16,13 +17,16 @@ SOURCES += \
 HEADERS += \
     mainwindow.h \
     luckfoxdiscovery.h \
-    serialcontroller.h \
+    networkcontroller.h \
+    hostwifimonitor.h \
     cameramanager.h \
     trackingengine.h \
     dnnthread.h
 
 FORMS += \
     mainwindow.ui
+
+win32:LIBS += -lwlanapi
 
 # Default rules for deployment.
 qnx: target.path = /tmp/$${TARGET}/bin

@@ -495,10 +495,13 @@ DnnThread *TrackingEngine::ensureDnnThread(const QString &modelFileName)
 
     DnnThread *thread = new DnnThread(key, this);
     m_dnnThreads.insert(key, thread);
+    // 这些回调只处理引擎状态，由 m_stateMutex 保护，不访问 QWidget。
+    // 在推理线程处理，避免 GUI 等待 CSRT 占用的状态锁或执行外观重捕。
+    // DnnThread 必须先释放输入锁再发结果，保持 state -> input 的锁顺序。
     connect(thread, &DnnThread::dnnTrackedResult,
-            this, &TrackingEngine::onDnnResultReceived, Qt::QueuedConnection);
+            this, &TrackingEngine::onDnnResultReceived, Qt::DirectConnection);
     connect(thread, &DnnThread::yoloDetectionResult,
-            this, &TrackingEngine::onYoloDetectionResult, Qt::QueuedConnection);
+            this, &TrackingEngine::onYoloDetectionResult, Qt::DirectConnection);
     connect(thread, &DnnThread::dnnWarmupFinished, this,
             [this, thread](bool success, const QString &message) {
         emit logMessage(

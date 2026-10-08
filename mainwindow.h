@@ -2,7 +2,10 @@
 #define MAINWINDOW_H
 
 #include <QMainWindow>
-#include "serialcontroller.h"
+#include "networkcontroller.h"
+#include "hostwifimonitor.h"
+#include <QLabel>
+#include <QResizeEvent>
 #include "cameramanager.h"
 #include "luckfoxdiscovery.h"
 #include "trackingengine.h"
@@ -28,18 +31,21 @@ QT_END_NAMESPACE
 
 /**
  * @brief Qt 桌面主窗口类
- * 负责整个程序的界面呈现、用户交互（如鼠标框选）、各子模块（相机、串口、引擎）的管理调度，
+ * 负责整个程序的界面呈现、用户交互（如鼠标框选）、各子模块（相机、无线控制、引擎）的管理调度，
  * 并负责汇总数据进行界面 UI 的实时重绘。
  */
 class MainWindow : public QMainWindow
 {
     Q_OBJECT
+#ifdef TRACKING_CONCURRENCY_TEST
+    friend class TrackingConcurrencyTest;
+#endif
 
 public:
     /// @brief 追踪后端枚举：YOLO 或 传统特征点混合
     enum class TrackingBackend { Yolo, Feature };
 
-    MainWindow(QWidget *parent = nullptr);
+    MainWindow(QWidget *parent = nullptr, bool autoConnect = true);
     ~MainWindow() override;
 
     /**
@@ -59,7 +65,6 @@ public:
 
 private slots:
     // UI 按钮与控件事件的槽函数
-    void on_pushButton_clicked();               ///< 可能是连接/断开串口等按钮
     void on_pushButton_8_clicked();             ///< 某控制按钮
     void onCameraChanged(int index);            ///< 用户切换摄像头下拉框
     void on_pushButton_9_clicked();             ///< 开启/关闭摄像头等按钮
@@ -76,8 +81,8 @@ private slots:
     void on_btnSelectTarget_clicked();          ///< 点击“选择目标”按钮
     void on_btnStartTracking_clicked();         ///< 点击“开始追踪”按钮
     void on_btnStopTracking_clicked();          ///< 点击“停止追踪”按钮
-    void on_pushButton_2_clicked();             ///< 串口云台测试/移动控制指令
-    void on_pushButton_3_clicked();             ///< 串口云台测试/移动控制指令
+    void on_pushButton_2_clicked();             ///< 无线控制云台测试/移动控制指令
+    void on_pushButton_3_clicked();             ///< 无线控制云台测试/移动控制指令
     void on_pushButton_4_clicked();             ///< 手动模式：向上步进
     void on_pushButton_5_clicked();             ///< 手动模式：向左步进
     void on_pushButton_6_clicked();             ///< 手动模式：向右步进
@@ -93,18 +98,32 @@ protected:
     void mouseMoveEvent(QMouseEvent *event) override;
     void mouseReleaseEvent(QMouseEvent *event) override;
     void paintEvent(QPaintEvent *event) override;
+    void resizeEvent(QResizeEvent *event) override;
 
 private:
     /// @brief 测试 DNN 环境可用性的内部方法
     void testDNN();
+    void setupNetworkUi();
+    void openNetworkControl(const QString &source);
+    void startDeviceDiscovery();
+    void finishDeviceDiscovery();
+    void stopLocalControl();
+    void updateGimbalStatus();
+    HostWifiMonitor m_hostWifi;
+    QLabel *m_gimbalStatus = nullptr;
+    QString m_deviceUrl;
+    bool m_openVideoAfterDiscovery = false;
+    QTimer m_deviceReconnectTimer;
+    bool m_modeSwitchPending = false;
+    QList<QPair<QWidget *, QRect>> m_baseGeometries;
     
-    /// @brief 向串口发送命令字的内部包装方法
+    /// @brief 向无线控制发送命令字的内部包装方法
     void sendCommand(uint8_t cmd);
 
     /// @brief 更新四个手动步进按钮的可用状态
     void updateManualControlAvailability();
 
-    /// @brief 根据摄像头、串口、模式和追踪状态更新追踪按钮
+    /// @brief 根据摄像头、无线控制、模式和追踪状态更新追踪按钮
     void updateTrackingControlAvailability();
 
     /// @brief 将特征跟踪帧交给独立线程，始终只保留最新帧
@@ -129,7 +148,7 @@ private:
     bool isFeatureTrackingSelected() const;
 
     Ui::MainWindow *ui;                      ///< UI 界面对象
-    SerialController m_serialController;     ///< 串口控制器模块
+    NetworkController m_networkController;     ///< 无线控制器模块
     CameraManager m_cameraManager;           ///< 摄像头管理器模块
     LuckfoxDiscovery m_luckfoxDiscovery;
     TrackingEngine m_trackingEngine;         ///< 目标追踪引擎核心模块
@@ -168,7 +187,7 @@ private:
     bool m_forceResetTracking;               ///< 是否强制重置追踪状态
     bool m_waitingForRecover;                ///< 是否正处于丢失后等待恢复阶段
     QPixmap m_renderCanvas;                  ///< 界面重绘用的像素画布缓存
-    qint64 m_lastSerialSendTime;             ///< 上次通过串口发送数据的毫秒时间戳
+    qint64 m_lastControlSendTime;             ///< 上次通过无线控制发送数据的毫秒时间戳
     int m_lastRemoteMode = -1;               ///< 最近一次遥测模式，重连时会重置
     qint64 m_lastFpsCalcTime = 0;            ///< FPS 统计窗口起始时间
     int m_fpsFrameCount = 0;                 ///< 当前 FPS 窗口内帧数

@@ -20,6 +20,9 @@
 class TrackingEngine : public QObject
 {
     Q_OBJECT
+#ifdef TRACKING_CONCURRENCY_TEST
+    friend class TrackingConcurrencyTest;
+#endif
 public:
     explicit TrackingEngine(QObject *parent = nullptr);
     ~TrackingEngine();

@@ -1,0 +1,35 @@
+#!/bin/sh
+PIDFILE=/var/run/luckfox-control.pid
+SCRIPT=/oem/usr/bin/luckfox-control.py
+CONFIG=/userdata/cfg/luckfox-control.json
+LOG=/tmp/luckfox-control.log
+running() {
+  [ -f "$PIDFILE" ] || return 1
+  control_pid=$(cat "$PIDFILE")
+  case "$control_pid" in ''|*[!0-9]*) return 1 ;; esac
+  kill -0 "$control_pid" 2>/dev/null || return 1
+  [ -r "/proc/$control_pid/cmdline" ] || return 1
+  tr '\000' '\n' < "/proc/$control_pid/cmdline" | grep -Fxq "$SCRIPT"
+}
+case "$1" in
+  start)
+    [ -f "$CONFIG" ] || { echo "control: UART 未配置，未启动"; exit 0; }
+    running && exit 0
+    rm -f "$PIDFILE"
+    start-stop-daemon -S -b -m -p "$PIDFILE" -x /bin/sh -- -c 'exec "$1" -S "$2" --config "$3" >>"$4" 2>&1' control /usr/bin/python3 "$SCRIPT" "$CONFIG" "$LOG" || exit 1
+    sleep 1
+    running || { echo "control: 启动失败，请检查 $LOG"; rm -f "$PIDFILE"; exit 1; }
+    echo "control: 已启动"
+    ;;
+  stop)
+    if running; then
+      start-stop-daemon -K -p "$PIDFILE" -x /usr/bin/python3 2>/dev/null
+      for control_wait in 1 2 3; do running || break; sleep 1; done
+      running && { echo "control: 停止超时"; exit 1; }
+    fi
+    rm -f "$PIDFILE"
+    ;;
+  restart) "$0" stop && "$0" start ;;
+  status) running && { echo "control: 正在运行"; exit 0; }; echo "control: 未运行"; exit 1 ;;
+  *) echo "usage: $0 {start|stop|restart|status}"; exit 1 ;;
+esac

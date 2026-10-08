@@ -1,6 +1,35 @@
-# 上下位机串口协议 v2
+# 无线云台协议：Qt ↔ Luckfox ↔ STM32
 
-适用：Qt 上位机 (`serialcontroller.cpp`) ⇄ STM32 下位机 (`main.c`)。
+电脑 Qt 使用 RTSP 接收视频，使用 UDP 5005 发送控制消息并接收状态。电脑端没有 UART/COM 操作。
+Luckfox `luckfox-control.py` 将网络消息转换为下述 UART 协议 v2，接收 STM32 遥测与 ACK 后返回电脑。
+
+## 网络控制协议 v1
+
+UDP JSON 消息不超过 1200 字节，所有消息包含 `version: 1`、随机 `session` 和 `type`。
+会话绑定电脑的源 IP 与源端口；同一时刻只接受一个控制端。
+
+| 方向 | type | 字段和用途 |
+| --- | --- | --- |
+| Qt → Luckfox | hello | 建立会话；会话过期后使用新的 session，禁止重放旧会话 |
+| Luckfox → Qt | welcome | 转发服务已响应；本消息不代表 STM32 在线 |
+| Qt → Luckfox | heartbeat | 维持网络会话；电脑每 100ms 发一次，1s 超时释放控制权 |
+| Qt → Luckfox | track | `seq`、有符号 int16 范围的 `x`、`y`；偏移以处理后画面中心为原点 |
+| Qt → Luckfox | command | `request`、`cmd`；request 为会话内递增的请求编号 |
+| Luckfox → Qt | status | `seq`、`online`、`mode`、`horizontal`、`vertical`；角度单位为度 |
+| Luckfox → Qt | ack / command_failed | 原 `request` 与 `cmd`；ack 只能来源于 STM32 的 UART ACK |
+| Qt → Luckfox | bye | 释放会话，板端停止跟踪、回中并停止 UART 心跳 |
+
+目标偏移按序号丢弃乱序/重复数据，板端只保留最新值，超过 200ms 不再发送。转发最短间隔 20ms。
+停止、回中、切换模式、重新开始时清除坐标缓存。
+Qt 仅在转发服务响应且 STM32 有效遥测在线时启用控制；遥测超时 1s 禁用。
+网络重发间隔 200ms，最多重发 3 次，使用相同 request。板端缓存结果并去重，手动步进不会因网络 ACK 丢失而重复执行。
+UART 的旧协议不带请求编号，所以板端不重发非幂等命令；等待 ACK 超过 450ms 时报告失败、释放会话并停止控制。
+网络会话超时或退出时停止/回中；停止 UART 心跳后仍由 STM32 自身的链路保护兜底。
+status 序号只用于状态顺序，不代表视频帧号；本协议没有测量端到端延迟。
+
+## Luckfox ↔ STM32 UART 协议 v2
+
+适用：Luckfox 板端 ⇄ STM32 下位机 (`main.c`)。
 物理层：UART 115200-8-N-1。字节序：大端（高字节在前）。
 
 ## 1. 帧结构（双向统一）
@@ -23,9 +52,9 @@
 
 | TYPE | 名称        | PAYLOAD                          | 说明 |
 |------|-------------|----------------------------------|------|
-| 0x01 | TRACK_DATA  | int16 offsetX, int16 offsetY     | 目标相对画面中心的像素偏移，自动模式锁定期间每 20ms 一帧 |
+| 0x01 | TRACK_DATA  | int16 offsetX, int16 offsetY     | 目标相对画面中心的像素偏移，合法坐标转发最短间隔 20ms |
 | 0x02 | CMD         | uint8 cmd                        | 控制命令，下位机必须回 ACK |
-| 0x03 | HEARTBEAT   | 无                               | 心跳，串口打开期间每 200ms 一帧，无需应答 |
+| 0x03 | HEARTBEAT   | 无                               | 网络会话有效期间每 200ms 一帧，无需应答 |
 
 CMD 命令码（沿用 v1）：
 
@@ -54,20 +83,21 @@ CMD 命令码（沿用 v1）：
 
 | 机制 | 参数 | 行为 |
 |------|------|------|
-| 命令 ACK 重传（上位机） | 150ms 超时，最多重发 3 次 | 全部失败发 `commandFailed` 信号，UI 告警 |
+| 网络命令 ACK 重传（Qt） | 200ms 超时，最多重发 3 次 | 同一 request 重发，板端去重；失败发 `commandFailed` |
+| UART 命令 ACK 等待（Luckfox） | 450ms 超时 | 不重发非幂等命令，报告失败并释放会话 |
 | 跟踪数据超时（下位机） | 200ms 无合法 TRACK_DATA | 偏移量清零，云台保持当前角度（目标短暂丢失的正常情形） |
 | 链路超时（下位机） | 1000ms 无任何合法帧 | **失控保护**：停止跟踪、云台回中、OLED 显示 `LINK LOST`（手动模式不受影响） |
 | 遥测超时（上位机） | 1000ms 无 TELEMETRY | UI 显示下位机离线告警 |
-| 断线检测（上位机） | QSerialPort::errorOccurred | 关闭端口，进入自动重连（每 2s 尝试一次），UI 显示重连状态 |
+| 网络断线检测（Qt） | 转发服务超过 1s 无有效响应 | 禁用控制、清除待发命令，以新会话重新握手 |
 
 链路时间戳由**任意合法帧**（TRACK_DATA / CMD / HEARTBEAT）刷新，因此只要串口物理连通、
-上位机存活，心跳即可维持链路；目标丢失只触发"数据超时"而不会触发失控保护。
+电脑网络会话有效，板端心跳即可维持链路；目标丢失只触发"数据超时"而不会触发失控保护。
 
 ## 4. 关闭流程（上位机退出）
 
-1. 发送 CMD 0x12（停止跟踪）、CMD 0x02（回中），各等待 ACK（最长 300ms）；
-2. 无论是否收到 ACK 都执行 `waitForBytesWritten` 确保字节出队后再关闭串口；
-3. 即使停止命令全部丢失，下位机也会在 1s 后由链路超时保护自动回中。
+1. Qt 停止本地跟踪并发送网络 `bye`；
+2. Luckfox 发送 CMD 0x12（停止跟踪）、CMD 0x02（回中），随后停止 UART 心跳；
+3. 网络 bye 丢失时，Luckfox 会话 1s 超时后执行同样处理；STM32 自身仍保留 UART 链路超时保护。
 
 ## 5. 与 v1 的差异
 

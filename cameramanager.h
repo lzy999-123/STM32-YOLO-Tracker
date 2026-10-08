@@ -26,6 +26,9 @@ Q_DECLARE_METATYPE(cv::Mat)
 class CameraManager : public QObject
 {
     Q_OBJECT
+#ifdef TRACKING_CONCURRENCY_TEST
+    friend class TrackingConcurrencyTest;
+#endif
 
 public:
     /// @brief 摄像头状态枚举

@@ -1,0 +1,16 @@
+/dts-v1/;
+/plugin/;
+
+/* Luckfox Pico Plus: pin 1 GPIO1_B2 TX -> STM32 PA3 RX;
+ * pin 2 GPIO1_B3 RX <- STM32 PA2 TX. The board DT already selects UART2_M1.
+ * Apply to the boot DT, remove UART2 earlycon/console bootargs, rebuild the
+ * FIT data-size/hash, and reboot. A runtime overlay alone cannot release FIQ.
+ * Preserve every root/storage/network/camera setting in the actual boot DT.
+ */
+&{/fiq-debugger} {
+    status = "disabled";
+};
+
+&{/serial@ff4c0000} {
+    status = "okay";
+};

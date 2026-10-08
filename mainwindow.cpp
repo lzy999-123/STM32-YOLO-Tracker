@@ -11,10 +11,15 @@
 #include <QPushButton>
 #include <QDoubleSpinBox>
 #include <QScopeGuard>
-#include <QSerialPortInfo>
+#include <QUrl>
+#include <QStatusBar>
+#include <QLabel>
+#include <QMenu>
+#include <QResizeEvent>
 #include <QTimer>
 
 #include <algorithm>
+#include <utility>
 
 namespace {
 constexpr int kRealtimeWidth = 1280;
@@ -45,7 +50,7 @@ QString normalizedRtspSource(QString source)
 }
 }
 
-MainWindow::MainWindow(QWidget *parent)
+MainWindow::MainWindow(QWidget *parent, bool autoConnect)
     : QMainWindow(parent)
     , ui(new Ui::MainWindow)
     , m_isCapturing(false)
@@ -59,16 +64,22 @@ MainWindow::MainWindow(QWidget *parent)
     , m_wasTrackingBeforeDisconn(false)
     , m_forceResetTracking(false)
     , m_waitingForRecover(false)
-    , m_lastSerialSendTime(0)
+    , m_lastControlSendTime(0)
     , m_dnnFrameSkipCounter(0)
     , m_lostFrameCount(0)
 {
     ui->setupUi(this);
     cv::setNumThreads(4);
-    setWindowTitle(QStringLiteral("STM32云台双核自动跟踪系统"));
+    setWindowTitle(QStringLiteral("Luckfox 无线云台跟踪系统"));
 
     ui->imageLabel->setAlignment(Qt::AlignCenter);
-    QPixmap initPlaceholder(640, 480);
+    ui->imageLabel->setScaledContents(false);
+    ui->imageLabel->setStyleSheet(QStringLiteral("background-color: black; border: none;"));
+    setMinimumSize(1100, 700);
+    ui->plainTextEdit_2->setMaximumBlockCount(500);
+    ui->plainTextEdit->setPlainText(QStringLiteral("X：—\nY：—"));
+    ui->label_11->setText(QStringLiteral("离线"));
+    QPixmap initPlaceholder(ui->imageLabel->size());
     initPlaceholder.fill(QColor(50, 50, 50));
     QPainter initPainter(&initPlaceholder);
     initPainter.setPen(Qt::white);
@@ -93,10 +104,10 @@ MainWindow::MainWindow(QWidget *parent)
         button->setEnabled(false);
         button->setToolTip(QStringLiteral("仅手动模式可用，每次转动 0.5°"));
     }
-    ui->label_11->setText(QStringLiteral("手动"));
+    ui->label_11->setText(QStringLiteral("离线"));
     ui->label_11->setStyleSheet(QStringLiteral("color: black; font-size: 14px; font-weight: bold;"));
 
-    on_pushButton_8_clicked();
+    setupNetworkUi();
     testDNN();
 
     connect(&m_trackingEngine, &TrackingEngine::targetTracked, this,
@@ -119,47 +130,44 @@ MainWindow::MainWindow(QWidget *parent)
         updateTrackingControlAvailability();
     });
 
-    // 串口链路状态信号（协议 v2）：断线/重连/下位机在线/命令失败
-    connect(&m_serialController, &SerialController::connectionLost, this,
+    connect(&m_networkController, &NetworkController::connectionLost, this,
             [this](const QString &reason) {
-        ui->plainTextEdit_2->appendPlainText(
-            QStringLiteral("【串口】连接丢失：%1，自动重连中...").arg(reason));
-        ui->LED1->setStyleSheet(QStringLiteral("background-color:yellow"));
-        ui->lineEdit->setText(QStringLiteral("重连中..."));
-        ui->pushButton_2->setEnabled(false);
-        ui->pushButton_3->setEnabled(false);
-        updateManualControlAvailability();
-        updateTrackingControlAvailability();
+        m_modeSwitchPending = false;
+        ui->plainTextEdit_2->appendPlainText(QStringLiteral("【无线控制】%1").arg(reason));
+        stopLocalControl();
+        updateGimbalStatus();
     });
-    connect(&m_serialController, &SerialController::reconnected, this, [this]() {
-        ui->plainTextEdit_2->appendPlainText(QStringLiteral("【串口】自动重连成功"));
-        ui->LED1->setStyleSheet(QStringLiteral("background-color:green"));
-        ui->lineEdit->setText(QStringLiteral("已连接"));
-        ui->pushButton_2->setEnabled(true);
-        ui->pushButton_3->setEnabled(true);
-        updateManualControlAvailability();
-        updateTrackingControlAvailability();
+    connect(&m_networkController, &NetworkController::reconnected, this, [this] {
+        qInfo() << "[Device] control_connected";
+        ui->plainTextEdit_2->appendPlainText(QStringLiteral("【无线控制】Luckfox 转发服务已连接，等待 STM32 遥测"));
+        updateGimbalStatus();
     });
-    connect(&m_serialController, &SerialController::deviceOnlineChanged, this,
-            [this](bool online) {
-        if (online) {
-            ui->plainTextEdit_2->appendPlainText(QStringLiteral("【串口】下位机已上线"));
-            m_lastRemoteMode = -1; // 强制下一帧遥测刷新模式显示（label_11 可能停留在"离线"）
-        } else {
-            ui->plainTextEdit_2->appendPlainText(
-                QStringLiteral("【串口】下位机无响应（遥测超时）"));
-            ui->label_11->setText(QStringLiteral("离线"));
-            ui->label_11->setStyleSheet(
-                QStringLiteral("color: gray; font-size: 14px; font-weight: bold;"));
+    connect(&m_networkController, &NetworkController::deviceOnlineChanged, this, [this](bool online) {
+        qInfo() << "[Device] stm32_online=" << online;
+        if (!online) stopLocalControl();
+        m_lastRemoteMode = -1;
+        updateGimbalStatus();
+    });
+    connect(&m_networkController, &NetworkController::commandFailed, this, [this](uint8_t cmd) {
+        m_modeSwitchPending = false;
+        ui->plainTextEdit_2->appendPlainText(QStringLiteral("【无线控制】命令 0x%1 未得到 STM32 确认")
+            .arg(cmd, 2, 16, QLatin1Char('0')));
+        stopLocalControl();
+        updateGimbalStatus();
+    });
+    connect(&m_networkController, &NetworkController::telemetryReceived, this,
+            [this](int mode, float horizontal, float vertical) {
+        m_gimbalStatus->setText(QStringLiteral("云台在线 · 水平 %1° / 垂直 %2°")
+            .arg(horizontal, 0, 'f', 1).arg(vertical, 0, 'f', 1));
+        if (mode != m_lastRemoteMode) {
+            m_modeSwitchPending = false;
+            m_lastRemoteMode = mode;
+            { QMutexLocker locker(&m_modeMutex); m_currentMode = mode; }
+            stopLocalControl();
         }
+        ui->label_11->setText(mode == 0 ? QStringLiteral("手动") : QStringLiteral("自动"));
         updateManualControlAvailability();
         updateTrackingControlAvailability();
-    });
-    connect(&m_serialController, &SerialController::commandFailed, this,
-            [this](uint8_t cmd) {
-        ui->plainTextEdit_2->appendPlainText(
-            QStringLiteral("【串口】命令 0x%1 发送失败（无 ACK）")
-                .arg(cmd, 2, 16, QLatin1Char('0')));
     });
 
     ui->comboBox_4->clear();
@@ -206,33 +214,30 @@ MainWindow::MainWindow(QWidget *parent)
     ui->pushButton_9->setText(QStringLiteral("打开摄像头"));
 
     connect(&m_luckfoxDiscovery, &LuckfoxDiscovery::found, this, [this](const QString &url) {
-        ui->comboBox_3->setEnabled(true);
-        ui->plainTextEdit_2->appendPlainText(QStringLiteral("【摄像头】已找到 Luckfox：%1，正在连接...").arg(url));
-        m_cameraManager.openCamera(url);
+        m_deviceUrl = url;
+        finishDeviceDiscovery();
+        ui->plainTextEdit_2->appendPlainText(QStringLiteral("【设备连接】已找到 Luckfox：%1").arg(QUrl(url).host()));
+        openNetworkControl(url);
+        const bool videoRequested = std::exchange(m_openVideoAfterDiscovery, false);
+        const bool addressChanged = selectedCameraSource(ui->comboBox_3) == QStringLiteral("luckfox:auto") &&
+            m_cameraManager.state() == CameraManager::CameraState::Open &&
+            url != m_cameraManager.currentCameraId();
+        if (videoRequested || addressChanged) m_cameraManager.openCamera(url);
+        else if (m_cameraManager.state() == CameraManager::CameraState::Idle ||
+                 m_cameraManager.state() == CameraManager::CameraState::Error)
+            ui->pushButton_9->setText(QStringLiteral("打开摄像头"));
+        ui->statusbar->showMessage(QStringLiteral("设备地址已刷新，控制通道正在确认连接"), 4000);
     });
     connect(&m_luckfoxDiscovery, &LuckfoxDiscovery::failed, this, [this](const QString &message) {
-        ui->comboBox_3->setEnabled(true);
-        ui->pushButton_9->setText(QStringLiteral("打开摄像头"));
-        ui->pushButton_9->setEnabled(true);
-        ui->plainTextEdit_2->appendPlainText(QStringLiteral("【摄像头】%1").arg(message));
-    });
-
-    QPushButton *btnRotate = new QPushButton(this);
-    btnRotate->setGeometry(415, 380, 80, 31);
-    btnRotate->setText(QStringLiteral("画面: 正常"));
-    btnRotate->setToolTip(QStringLiteral("点击循环切换画面方向：正常 -> 180° -> 水平镜像 -> 垂直翻转 -> 90° -> 270°"));
-    connect(btnRotate, &QPushButton::clicked, this, [this, btnRotate]() {
-        int mode = static_cast<int>(m_cameraManager.rotationMode());
-        mode = (mode + 1) % 6;
-        m_cameraManager.setRotationMode(static_cast<CameraManager::RotationMode>(mode));
-        switch (mode) {
-            case 0: btnRotate->setText(QStringLiteral("画面: 正常")); break;
-            case 1: btnRotate->setText(QStringLiteral("画面: 180°")); break;
-            case 2: btnRotate->setText(QStringLiteral("画面: 水平")); break;
-            case 3: btnRotate->setText(QStringLiteral("画面: 垂直")); break;
-            case 4: btnRotate->setText(QStringLiteral("画面: 90°")); break;
-            case 5: btnRotate->setText(QStringLiteral("画面: 270°")); break;
+        finishDeviceDiscovery();
+        if (std::exchange(m_openVideoAfterDiscovery, false)) {
+            ui->pushButton_9->setText(QStringLiteral("打开摄像头"));
+            ui->pushButton_9->setEnabled(true);
+            ui->lineEdit->setText(QStringLiteral("未找到"));
+            ui->LED1->setStyleSheet(QStringLiteral("background-color: red"));
         }
+        ui->plainTextEdit_2->appendPlainText(QStringLiteral("【设备连接】%1").arg(message));
+        ui->statusbar->showMessage(QStringLiteral("未找到设备，请检查同一 Wi-Fi；程序会自动重试"), 6000);
     });
 
     connect(ui->comboBox_3, QOverload<int>::of(&QComboBox::currentIndexChanged),
@@ -243,10 +248,24 @@ MainWindow::MainWindow(QWidget *parent)
             this, &MainWindow::handleNewMatFrame);
     connect(&m_cameraManager, &CameraManager::stateChanged, this,
             [this](CameraManager::CameraState state) {
+        QString status;
+        QString color = QStringLiteral("orange");
+        if (state == CameraManager::CameraState::Idle) { status = QStringLiteral("未连接"); color = QStringLiteral("red"); }
+        else if (state == CameraManager::CameraState::Open) { status = QStringLiteral("已连接"); color = QStringLiteral("green"); }
+        else if (state == CameraManager::CameraState::Opening) status = QStringLiteral("连接中");
+        else if (state == CameraManager::CameraState::Closing) status = QStringLiteral("关闭中");
+        else { status = QStringLiteral("连接失败"); color = QStringLiteral("red"); }
+        ui->lineEdit->setText(status);
+        ui->LED1->setStyleSheet(QStringLiteral("background-color: %1").arg(color));
+        if (state == CameraManager::CameraState::Idle || state == CameraManager::CameraState::Closing || state == CameraManager::CameraState::Error) {
+            stopLocalControl();
+            if (m_networkController.isOpen()) m_networkController.sendCommand(NetworkController::CmdTrackOff);
+        }
         if (state == CameraManager::CameraState::Idle) {
             ui->pushButton_9->setText(QStringLiteral("打开摄像头"));
             ui->pushButton_9->setEnabled(true);
         } else if (state == CameraManager::CameraState::Open) {
+            openNetworkControl(m_cameraManager.currentCameraId());
             ui->pushButton_9->setText(QStringLiteral("关闭摄像头"));
             ui->pushButton_9->setEnabled(true);
             if (m_cameraManager.currentCameraId().startsWith(QStringLiteral("rtsp://"), Qt::CaseInsensitive)) {
@@ -275,18 +294,29 @@ MainWindow::MainWindow(QWidget *parent)
         ui->pushButton_9->setEnabled(true);
         updateTrackingControlAvailability();
     });
+    for (QWidget *widget : ui->centralwidget->findChildren<QWidget *>(QString(), Qt::FindDirectChildrenOnly))
+        m_baseGeometries.append(qMakePair(widget, widget->geometry()));
     m_cameraManager.startChecking();
     updateTrackingControlAvailability();
+    m_deviceReconnectTimer.setInterval(5000);
+    connect(&m_deviceReconnectTimer, &QTimer::timeout, this, [this] {
+        if (!m_networkController.isConnected() && !m_luckfoxDiscovery.isActive() &&
+            selectedCameraSource(ui->comboBox_3) == QStringLiteral("luckfox:auto"))
+            startDeviceDiscovery();
+    });
+    if (autoConnect) {
+        m_deviceReconnectTimer.start();
+        QTimer::singleShot(0, this, &MainWindow::startDeviceDiscovery);
+    }
 }
 
 MainWindow::~MainWindow()
 {
+    m_deviceReconnectTimer.stop();
     m_luckfoxDiscovery.cancel();
     stopTrackingSafely();
     m_cameraManager.closeCamera();
-    if (m_serialController.isOpen()) {
-        m_serialController.closeSerial();
-    }
+    m_networkController.disconnectDevice();
     delete ui;
 }
 
@@ -389,7 +419,7 @@ void MainWindow::onTrackingModelChanged(int index)
     m_offsetY = 0;
     stopTrackingSafely();
     if (wasAutoTracking) {
-        sendCommand(SerialController::CmdTrackOff);
+        sendCommand(NetworkController::CmdTrackOff);
     }
 
     if (isFeatureTrackingSelected()) {
@@ -418,83 +448,126 @@ void MainWindow::testDNN()
     }
 }
 
-void MainWindow::on_pushButton_clicked()
+void MainWindow::on_pushButton_8_clicked()
 {
-    if (ui->pushButton->text() == QStringLiteral("打开串口")) {
-        if (ui->comboBox->currentText().isEmpty()) {
-            QMessageBox::warning(this, QStringLiteral("提示"), QStringLiteral("未检测到可用串口！"));
-            return;
-        }
-
-        if (m_serialController.openSerial(ui->comboBox->currentText(), ui->comboBox_2->currentText().toInt())) {
-            ui->lineEdit->setText(QStringLiteral("已连接"));
-            m_lastRemoteMode = -1;
-            disconnect(&m_serialController, &SerialController::telemetryReceived, this, nullptr);
-            connect(&m_serialController, &SerialController::telemetryReceived, this,
-                    [this](int remoteMode, float angle1, float angle2) {
-                ui->plainTextEdit_3->setPlainText(QString::number(angle1, 'f', 1));
-                ui->plainTextEdit_4->setPlainText(QString::number(angle2, 'f', 1));
-
-                if (remoteMode == m_lastRemoteMode) {
-                    updateManualControlAvailability();
-                    updateTrackingControlAvailability();
-                    return;
-                }
-                m_lastRemoteMode = remoteMode;
-
-                {
-                    QMutexLocker locker(&m_modeMutex);
-                    m_currentMode = remoteMode;
-                }
-                if (remoteMode == 0) {
-                    ui->label_11->setText(QStringLiteral("手动"));
-                    ui->label_11->setStyleSheet(QStringLiteral("color: black; font-size: 14px; font-weight: bold;"));
-                } else {
-                    ui->label_11->setText(QStringLiteral("自动"));
-                    ui->label_11->setStyleSheet(QStringLiteral("color: red; font-size: 14px; font-weight: bold;"));
-                }
-
-                m_isCapturing = false;
-                stopTrackingSafely();
-                m_trackedRect = cv::Rect2d();
-                m_isTargetTracked = false;
-                m_offsetX = 0;
-                m_offsetY = 0;
-                updateManualControlAvailability();
-                updateTrackingControlAvailability();
-            });
-
-            ui->pushButton->setText(QStringLiteral("关闭串口"));
-            ui->LED1->setStyleSheet(QStringLiteral("background-color:green"));
-            ui->pushButton_2->setEnabled(true);
-            ui->pushButton_3->setEnabled(true);
-            updateManualControlAvailability();
-            updateTrackingControlAvailability();
-            ui->plainTextEdit_2->appendPlainText(QStringLiteral("【串口】已连接，状态同步完成"));
-        } else {
-            ui->lineEdit->setText(QStringLiteral("串口打开失败！"));
-            QMessageBox::warning(this, QStringLiteral("提示"), QStringLiteral("串口打开失败！"));
-        }
+    qInfo() << "[Device] refresh_requested";
+    m_hostWifi.refresh();
+    ui->plainTextEdit_2->appendPlainText(QStringLiteral("【刷新】正在刷新 Wi-Fi 和设备连接状态..."));
+    ui->statusbar->showMessage(QStringLiteral("正在刷新设备连接..."));
+    if (selectedCameraSource(ui->comboBox_3) == QStringLiteral("luckfox:auto")) {
+        startDeviceDiscovery();
     } else {
-        ui->lineEdit->setText(QStringLiteral("未连接"));
-        ui->pushButton->setText(QStringLiteral("打开串口"));
-        ui->LED1->setStyleSheet(QStringLiteral("background-color:red"));
-        disconnect(&m_serialController, &SerialController::telemetryReceived, this, nullptr);
-        m_serialController.closeSerial();
-        m_lastRemoteMode = -1;
-        ui->pushButton_2->setEnabled(false);
-        ui->pushButton_3->setEnabled(false);
-        updateManualControlAvailability();
-        updateTrackingControlAvailability();
+        const QString source = selectedCameraSource(ui->comboBox_3);
+        if (source.startsWith(QStringLiteral("rtsp://"), Qt::CaseInsensitive) ||
+            QHostAddress(source).protocol() == QAbstractSocket::IPv4Protocol)
+            openNetworkControl(normalizedRtspSource(source));
+        ui->statusbar->showMessage(QStringLiteral("已刷新 Wi-Fi 和所选设备的控制连接"), 4000);
     }
 }
 
-void MainWindow::on_pushButton_8_clicked()
+void MainWindow::startDeviceDiscovery()
 {
-    ui->comboBox->clear();
-    const QList<QSerialPortInfo> ports = QSerialPortInfo::availablePorts();
-    for (const QSerialPortInfo &info : ports) {
-        ui->comboBox->addItem(info.portName());
+    ui->pushButton_8->setText(QStringLiteral("刷新中..."));
+    ui->pushButton_8->setEnabled(false);
+    ui->plainTextEdit_2->appendPlainText(QStringLiteral("【设备连接】正在查找 Luckfox..."));
+    if (!m_networkController.isConnected()) m_gimbalStatus->setText(QStringLiteral("云台：正在查找 Luckfox"));
+    m_luckfoxDiscovery.start();
+}
+
+void MainWindow::finishDeviceDiscovery()
+{
+    ui->pushButton_8->setText(QStringLiteral("刷新"));
+    ui->pushButton_8->setEnabled(true);
+    ui->comboBox_3->setEnabled(true);
+}
+
+void MainWindow::setupNetworkUi()
+{
+    ui->label_3->setText(QStringLiteral("读取中…"));
+    ui->label_9->setText(QStringLiteral("未发现"));
+    ui->label_3->setTextInteractionFlags(Qt::TextSelectableByMouse);
+    ui->label_9->setTextInteractionFlags(Qt::TextSelectableByMouse);
+    ui->lineEdit->setToolTip(QStringLiteral("此处仅表示视频通道状态；云台状态见底部"));
+    ui->LED1->setFocusPolicy(Qt::NoFocus);
+    ui->LED1->setAttribute(Qt::WA_TransparentForMouseEvents);
+    ui->pushButton_8->setToolTip(QStringLiteral("刷新电脑 Wi-Fi 信息并重新查找 Luckfox"));
+    m_gimbalStatus = new QLabel(QStringLiteral("云台：控制通道未连接"), this);
+    m_gimbalStatus->setObjectName(QStringLiteral("gimbalStatus"));
+    ui->statusbar->addWidget(m_gimbalStatus, 1);
+    auto *orientation = new QPushButton(QStringLiteral("画面方向"), this);
+    auto *menu = new QMenu(orientation);
+    const QStringList names{QStringLiteral("正常"), QStringLiteral("旋转 180°"),
+        QStringLiteral("水平镜像"), QStringLiteral("垂直翻转"), QStringLiteral("旋转 90°"), QStringLiteral("旋转 270°")};
+    for (int mode = 0; mode < names.size(); ++mode) {
+        auto *action = menu->addAction(names[mode]);
+        connect(action, &QAction::triggered, this, [this, mode] {
+            stopLocalControl();
+            if (m_networkController.isOpen()) m_networkController.sendCommand(NetworkController::CmdTrackOff);
+            m_cameraManager.setRotationMode(static_cast<CameraManager::RotationMode>(mode));
+        });
+    }
+    orientation->setMenu(menu);
+    ui->statusbar->addPermanentWidget(orientation);
+    connect(&m_hostWifi, &HostWifiMonitor::nameChanged, this, [this](const QString &name) {
+        ui->label_3->setToolTip(name);
+        ui->label_3->setText(ui->label_3->fontMetrics().elidedText(name, Qt::ElideRight, ui->label_3->width()));
+    });
+    m_hostWifi.refresh();
+}
+
+void MainWindow::openNetworkControl(const QString &source)
+{
+    const QUrl url(source);
+    if (url.scheme().compare(QStringLiteral("rtsp"), Qt::CaseInsensitive) != 0) {
+        return;
+    }
+    if (ui->label_9->text() != url.host()) {
+        stopLocalControl();
+        if (m_networkController.isOpen()) m_networkController.sendCommand(NetworkController::CmdTrackOff);
+    }
+    ui->label_9->setText(url.host());
+    ui->label_9->setToolTip(url.host());
+    m_networkController.connectToDevice(url.host());
+}
+
+void MainWindow::stopLocalControl()
+{
+    m_isCapturing = m_isSelecting = m_hasSelectedTarget = m_isTargetTracked = false;
+    m_wasTrackingBeforeDisconn = false;
+    m_selectedRect = m_trackedRect = cv::Rect2d();
+    m_offsetX = m_offsetY = 0;
+    stopTrackingSafely();
+    updateManualControlAvailability();
+    updateTrackingControlAvailability();
+}
+
+void MainWindow::updateGimbalStatus()
+{
+    if (!m_networkController.isOpen()) {
+        ui->label_11->setText(QStringLiteral("离线"));
+        m_gimbalStatus->setText(m_networkController.isConnected()
+            ? QStringLiteral("Luckfox 控制已连接 · STM32 离线")
+            : QStringLiteral("云台：控制通道未连接"));
+    }
+    updateManualControlAvailability();
+    updateTrackingControlAvailability();
+}
+
+void MainWindow::resizeEvent(QResizeEvent *event)
+{
+    QMainWindow::resizeEvent(event);
+    if (m_baseGeometries.isEmpty()) return;
+    const int dx = width() - 1100, dy = height() - 700;
+    for (const auto &entry : m_baseGeometries) {
+        QWidget *widget = entry.first;
+        QRect rect = entry.second;
+        if (widget == ui->imageLabel) {
+            rect.setSize(QSize(16, 9).scaled(QSize(832 + dx, 468 + dy), Qt::KeepAspectRatio));
+        } else if (rect.x() >= 860) {
+            rect.translate(dx, 0);
+            if (widget == ui->plainTextEdit_2) rect.setHeight(rect.height() + dy);
+        }
+        widget->setGeometry(rect);
     }
 }
 
@@ -542,16 +615,24 @@ void MainWindow::onCameraChanged(int index)
             ui->plainTextEdit_2->appendPlainText(QStringLiteral("【摄像头】切换 -> 本地物理摄像头（720P 高帧率模式）"));
         }
 
+        openNetworkControl(camId);
         m_cameraManager.openCamera(camId);
     }
 }
 
 void MainWindow::on_pushButton_9_clicked()
 {
-    if (m_luckfoxDiscovery.isActive()) {
+    if (m_openVideoAfterDiscovery) {
         m_luckfoxDiscovery.cancel();
-        ui->comboBox_3->setEnabled(true);
+        finishDeviceDiscovery();
         ui->pushButton_9->setText(QStringLiteral("打开摄像头"));
+        m_openVideoAfterDiscovery = false;
+        ui->pushButton_9->setText(m_cameraManager.state() == CameraManager::CameraState::Open
+            ? QStringLiteral("关闭摄像头") : QStringLiteral("打开摄像头"));
+        if (m_cameraManager.state() != CameraManager::CameraState::Open) {
+            ui->lineEdit->setText(QStringLiteral("未连接"));
+            ui->LED1->setStyleSheet(QStringLiteral("background-color: red"));
+        }
         ui->plainTextEdit_2->appendPlainText(QStringLiteral("【摄像头】已取消查找"));
         return;
     }
@@ -562,11 +643,18 @@ void MainWindow::on_pushButton_9_clicked()
 
         const QString source = selectedCameraSource(ui->comboBox_3);
         if (source == QStringLiteral("luckfox:auto")) {
+            if (!m_deviceUrl.isEmpty() && m_networkController.isConnected()) {
+                m_cameraManager.openCamera(m_deviceUrl);
+                return;
+            }
             ui->comboBox_3->setEnabled(false);
             ui->pushButton_9->setText(QStringLiteral("取消查找"));
             ui->pushButton_9->setEnabled(true);
+            m_openVideoAfterDiscovery = true;
+            ui->lineEdit->setText(QStringLiteral("查找中"));
+            ui->LED1->setStyleSheet(QStringLiteral("background-color: orange"));
             ui->plainTextEdit_2->appendPlainText(QStringLiteral("【摄像头】正在自动查找 Luckfox..."));
-            m_luckfoxDiscovery.start();
+            if (!m_luckfoxDiscovery.isActive()) startDeviceDiscovery();
             return;
         }
         const int selectedIndex = ui->comboBox_3->currentIndex();
@@ -589,6 +677,7 @@ void MainWindow::on_pushButton_9_clicked()
             ui->plainTextEdit_2->appendPlainText(QStringLiteral("【摄像头】启用本地物理摄像头（锁定 720P 低延迟模式）"));
         }
 
+        openNetworkControl(camId);
         m_cameraManager.openCamera(camId);
         return;
     }
@@ -766,7 +855,7 @@ void MainWindow::processLatestVideoFrame()
     }
     m_lastDisplayFrameTime = frameNow;
 
-    // 720P 极速约束：无论来自本地 USB 还是网络流，严格保障画面上限为 720P，全链路零负载延迟
+    // 720P 极速约束：无论来自本地 USB 还是网络流，严格保障画面上限为 720P，限制处理尺寸；实际延迟需独立测量
     if (cvMat.cols > kRealtimeWidth || cvMat.rows > kRealtimeHeight) {
         const double scale = std::min(static_cast<double>(kRealtimeWidth) / cvMat.cols,
                                       static_cast<double>(kRealtimeHeight) / cvMat.rows);
@@ -907,11 +996,11 @@ void MainWindow::processLatestVideoFrame()
 
     {
         QMutexLocker modeLocker(&m_modeMutex);
-        if (m_serialController.isOpen() && m_currentMode == 1 && m_isTargetTracked) {
+        if (m_networkController.isOpen() && m_currentMode == 1 && m_isTargetTracked) {
             const qint64 currentTime = QDateTime::currentMSecsSinceEpoch();
-            if (currentTime - m_lastSerialSendTime >= 20) {
-                m_serialController.sendTrackData(m_offsetX, m_offsetY);
-                m_lastSerialSendTime = currentTime;
+            if (currentTime - m_lastControlSendTime >= 20) {
+                m_networkController.sendTrackData(m_offsetX, m_offsetY);
+                m_lastControlSendTime = currentTime;
             }
         }
     }
@@ -931,23 +1020,27 @@ void MainWindow::processLatestVideoFrame()
                                                       : QStringLiteral("舵机Y → 居中\n");
             ui->plainTextEdit->setPlainText(info);
         } else if (!m_waitingForRecover) {
-            ui->plainTextEdit->setPlainText(QStringLiteral("未追踪到目标\n舵机保持居中"));
+            ui->plainTextEdit->setPlainText(QStringLiteral("X：—\nY：—"));
         }
     }
 }
 
 void MainWindow::on_btnSelectTarget_clicked()
 {
-    if (!m_serialController.isOpen()) {
-        QMessageBox::warning(this, QStringLiteral("提示"), QStringLiteral("请先连接串口！"));
+    if (!m_networkController.isOpen()) {
+        QMessageBox::warning(this, QStringLiteral("提示"), QStringLiteral("请先连接 Luckfox 并等待 STM32 云台上线！"));
         return;
     }
+    bool autoMode = false;
     {
         QMutexLocker locker(&m_modeMutex);
-        if (m_currentMode != 1) {
-            QMessageBox::warning(this, QStringLiteral("提示"), QStringLiteral("请先切换到自动模式！"));
-            return;
-        }
+        autoMode = (m_currentMode == 1);
+    }
+    // warning() 会开启嵌套事件循环，期间遥测/视频回调也会读取模式。
+    // 必须先释放非递归模式锁，否则同一个 GUI 线程会再次等待自己的锁。
+    if (!autoMode) {
+        QMessageBox::warning(this, QStringLiteral("提示"), QStringLiteral("请先切换到自动模式！"));
+        return;
     }
     if (m_cameraManager.state() != CameraManager::CameraState::Open) {
         QMessageBox::warning(this, QStringLiteral("提示"), QStringLiteral("请先打开摄像头！"));
@@ -971,16 +1064,18 @@ void MainWindow::on_btnSelectTarget_clicked()
 
 void MainWindow::on_btnStartTracking_clicked()
 {
-    if (!m_serialController.isOpen()) {
-        QMessageBox::warning(this, QStringLiteral("提示"), QStringLiteral("请先连接串口！"));
+    if (!m_networkController.isOpen()) {
+        QMessageBox::warning(this, QStringLiteral("提示"), QStringLiteral("请先连接 Luckfox 并等待 STM32 云台上线！"));
         return;
     }
+    bool autoMode = false;
     {
         QMutexLocker locker(&m_modeMutex);
-        if (m_currentMode != 1) {
-            QMessageBox::warning(this, QStringLiteral("提示"), QStringLiteral("请先切换到自动模式！"));
-            return;
-        }
+        autoMode = (m_currentMode == 1);
+    }
+    if (!autoMode) {
+        QMessageBox::warning(this, QStringLiteral("提示"), QStringLiteral("请先切换到自动模式！"));
+        return;
     }
     if (m_cameraManager.state() != CameraManager::CameraState::Open) {
         QMessageBox::warning(this, QStringLiteral("提示"), QStringLiteral("请先打开摄像头！"));
@@ -1023,7 +1118,7 @@ void MainWindow::on_btnStartTracking_clicked()
     updateTrackingControlAvailability();
 
     if (ui->label_11->text() == QStringLiteral("自动")) {
-        sendCommand(SerialController::CmdTrackOn);
+        sendCommand(NetworkController::CmdTrackOn);
     }
     ui->plainTextEdit_2->appendPlainText(
         useFeatureTracking ? QStringLiteral("开始特征跟踪（CSRT + ORB）！")
@@ -1056,7 +1151,7 @@ void MainWindow::on_btnStopTracking_clicked()
         }
     }
     if (ui->label_11->text() == QStringLiteral("自动")) {
-        sendCommand(SerialController::CmdTrackOff);
+        sendCommand(NetworkController::CmdTrackOff);
     }
     ui->plainTextEdit_2->appendPlainText(QStringLiteral("停止跟踪！"));
 }
@@ -1197,58 +1292,30 @@ void MainWindow::paintEvent(QPaintEvent *event)
 
 void MainWindow::on_pushButton_2_clicked()
 {
-    QMutexLocker locker(&m_modeMutex);
-    ui->pushButton_2->setEnabled(false);
-    QTimer::singleShot(100, this, [this]() { ui->pushButton_2->setEnabled(true); });
-
-    m_isCapturing = false;
-    stopTrackingSafely();
-    m_trackedRect = cv::Rect2d();
-    m_isTargetTracked = false;
-    m_hasSelectedTarget = false;
-    m_isSelecting = false;
-    m_offsetX = 0;
-    m_offsetY = 0;
-    sendCommand(SerialController::CmdCenter);
-    updateTrackingControlAvailability();
+    if (!m_networkController.isOpen()) return;
+    stopLocalControl();
+    sendCommand(NetworkController::CmdCenter);
 }
 
 void MainWindow::on_pushButton_3_clicked()
 {
-    if (!m_serialController.isOpen()) {
-        QMessageBox::warning(this, QStringLiteral("提示"), QStringLiteral("请先连接串口！"));
-        return;
-    }
-
-    {
-        QMutexLocker locker(&m_modeMutex);
-        m_currentMode = !m_currentMode;
-        if (m_currentMode == 0) {
-            ui->label_11->setText(QStringLiteral("手动"));
-            ui->label_11->setStyleSheet(QStringLiteral("color: black; font-size: 14px; font-weight: bold;"));
-        } else {
-            ui->label_11->setText(QStringLiteral("自动"));
-            ui->label_11->setStyleSheet(QStringLiteral("color: red; font-size: 14px; font-weight: bold;"));
-        }
-
-        m_isCapturing = false;
-        stopTrackingSafely();
-        m_trackedRect = cv::Rect2d();
-        m_isTargetTracked = false;
-        m_hasSelectedTarget = false;
-        m_isSelecting = false;
-        m_offsetX = 0;
-        m_offsetY = 0;
-        sendCommand(SerialController::CmdSwitchMode);
-    }
-    updateManualControlAvailability();
-
+    if (!m_networkController.isOpen()) return;
+    m_modeSwitchPending = true;
+    stopLocalControl();
+    sendCommand(NetworkController::CmdSwitchMode);
+    // 实际模式只由 STM32 遥测更新，不能先在 UI 中假定切换成功。
     ui->pushButton_3->setEnabled(false);
-    QTimer::singleShot(100, this, [this]() { ui->pushButton_3->setEnabled(true); });
+    QTimer::singleShot(500, this, [this] {
+        m_modeSwitchPending = false;
+        updateManualControlAvailability();
+        updateTrackingControlAvailability();
+    });
 }
 
 void MainWindow::updateManualControlAvailability()
 {
+    ui->pushButton_2->setEnabled(m_networkController.isOpen());
+    ui->pushButton_3->setEnabled(m_networkController.isOpen() && !m_modeSwitchPending);
     bool manual = false;
     {
         QMutexLocker locker(&m_modeMutex);
@@ -1256,7 +1323,7 @@ void MainWindow::updateManualControlAvailability()
     }
 
     // 遥测离线时 label_11 会显示“离线”，此时不允许误发手动步进命令。
-    const bool enabled = m_serialController.isOpen() && manual &&
+    const bool enabled = m_networkController.isOpen() && !m_modeSwitchPending && manual &&
                          ui->label_11->text() == QStringLiteral("手动");
     for (QPushButton *button : {ui->pushButton_4, ui->pushButton_5,
                                 ui->pushButton_6, ui->pushButton_7}) {
@@ -1275,15 +1342,15 @@ void MainWindow::updateTrackingControlAvailability()
         autoMode = (m_currentMode == 1);
     }
 
-    const bool serialReady = m_serialController.isOpen();
+    const bool controlReady = m_networkController.isOpen() && !m_modeSwitchPending;
     const bool modelReady = isFeatureTrackingSelected() ||
                             (m_trackingEngine.yoloReady() &&
                              m_trackingEngine.yoloWarmedUp());
 
-    // 追踪属于自动模式功能；停止按钮保留给当前追踪状态，便于串口异常时先停止本地线程。
-    const bool canSelect = cameraReady && serialReady && autoMode &&
+    // 追踪属于自动模式功能；停止按钮保留给当前追踪状态，便于网络控制异常时先停止本地线程。
+    const bool canSelect = cameraReady && controlReady && autoMode &&
                            !m_isCapturing && !m_isSelecting;
-    const bool canStart = cameraReady && serialReady && autoMode &&
+    const bool canStart = cameraReady && controlReady && autoMode &&
                           m_hasSelectedTarget && !m_isCapturing && modelReady;
     const bool canStop = m_isCapturing;
 
@@ -1294,9 +1361,9 @@ void MainWindow::updateTrackingControlAvailability()
     if (!cameraReady) {
         ui->btnSelectTarget->setToolTip(QStringLiteral("请先打开摄像头"));
         ui->btnStartTracking->setToolTip(QStringLiteral("请先打开摄像头"));
-    } else if (!serialReady) {
-        ui->btnSelectTarget->setToolTip(QStringLiteral("请先连接串口"));
-        ui->btnStartTracking->setToolTip(QStringLiteral("请先连接串口"));
+    } else if (!controlReady) {
+        ui->btnSelectTarget->setToolTip(QStringLiteral("请先连接 Luckfox 并等待云台上线"));
+        ui->btnStartTracking->setToolTip(QStringLiteral("请先连接 Luckfox 并等待云台上线"));
     } else if (!autoMode) {
         ui->btnSelectTarget->setToolTip(QStringLiteral("自动模式下才能进行目标追踪"));
         ui->btnStartTracking->setToolTip(QStringLiteral("自动模式下才能开始追踪"));
@@ -1320,8 +1387,8 @@ void MainWindow::sendManualStep(uint8_t cmd, const QString &direction)
         manual = (m_currentMode == 0);
     }
 
-    if (!m_serialController.isOpen()) {
-        QMessageBox::warning(this, QStringLiteral("提示"), QStringLiteral("请先连接串口！"));
+    if (!m_networkController.isOpen()) {
+        QMessageBox::warning(this, QStringLiteral("提示"), QStringLiteral("请先连接 Luckfox 并等待 STM32 云台上线！"));
         return;
     }
     if (!manual || ui->label_11->text() != QStringLiteral("手动")) {
@@ -1338,37 +1405,35 @@ void MainWindow::sendManualStep(uint8_t cmd, const QString &direction)
 
 void MainWindow::on_pushButton_4_clicked()
 {
-    sendManualStep(SerialController::CmdManualUp, QStringLiteral("向上"));
+    sendManualStep(NetworkController::CmdManualUp, QStringLiteral("向上"));
 }
 
 void MainWindow::on_pushButton_5_clicked()
 {
-    sendManualStep(SerialController::CmdManualLeft, QStringLiteral("向左"));
+    sendManualStep(NetworkController::CmdManualLeft, QStringLiteral("向左"));
 }
 
 void MainWindow::on_pushButton_6_clicked()
 {
-    sendManualStep(SerialController::CmdManualRight, QStringLiteral("向右"));
+    sendManualStep(NetworkController::CmdManualRight, QStringLiteral("向右"));
 }
 
 void MainWindow::on_pushButton_7_clicked()
 {
-    sendManualStep(SerialController::CmdManualDown, QStringLiteral("向下"));
+    sendManualStep(NetworkController::CmdManualDown, QStringLiteral("向下"));
 }
 
 void MainWindow::sendCommand(uint8_t cmd)
 {
-    m_serialController.sendCommand(cmd);
+    m_networkController.sendCommand(cmd);
 }
 
 void MainWindow::closeEvent(QCloseEvent *event)
 {
-    stopTrackingSafely();
-    if (m_serialController.isOpen()) {
-        // 发送停止跟踪+回中并等待字节写出；即使丢包，下位机链路超时保护也会兜底回中
-        m_serialController.shutdownGimbal();
-        m_serialController.closeSerial();
-    }
+    m_deviceReconnectTimer.stop();
+    m_luckfoxDiscovery.cancel();
+    stopLocalControl();
+    m_networkController.shutdownGimbal();
     m_cameraManager.closeCamera();
     event->accept();
 }

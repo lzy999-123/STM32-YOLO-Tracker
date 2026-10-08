@@ -16,6 +16,9 @@
 class DnnThread : public QThread
 {
     Q_OBJECT
+#ifdef TRACKING_CONCURRENCY_TEST
+    friend class TrackingConcurrencyTest;
+#endif
 public:
     /**
      * @brief 构造函数

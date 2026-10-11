@@ -12,8 +12,104 @@ private slots:
     void commandRetryKeepsRequestIdAndNetworkLossDisablesControls();
     void authSigningAndVerification();
     void telemetryFlagsAreReported();
+    void variableManualStepPreservesSelectionAcrossRetriesAndQueue();
+    void calibrationProfileRequiresFreshValidStatus();
     void bridgeOverWifi();
 };
+
+void NetworkControllerTest::calibrationProfileRequiresFreshValidStatus()
+{
+    QUdpSocket server;
+    QVERIFY(server.bind(QHostAddress(QHostAddress::LocalHost), quint16(0)));
+    NetworkController control;
+    control.setAuthKey({});
+    QSignalSpy profiles(&control, &NetworkController::calibrationReceived);
+    control.connectToDevice(QStringLiteral("127.0.0.1"), server.localPort());
+    QTRY_VERIFY(server.hasPendingDatagrams());
+    const auto hello = server.receiveDatagram();
+    const auto session = QJsonDocument::fromJson(hello.data()).object().value("session").toString();
+    auto reply = [&](QJsonObject body) {
+        body.insert("version", 1); body.insert("session", session);
+        server.writeDatagram(QJsonDocument(body).toJson(QJsonDocument::Compact), hello.senderAddress(), hello.senderPort());
+    };
+    reply({{"type", "welcome"}});
+    QTRY_VERIFY(control.isConnected());
+    const QJsonObject calibration{{"valid", true}, {"horizontal", 40}, {"vertical", 200},
+        {"horizontal_min", -60}, {"horizontal_max", 70}, {"vertical_min", 140}, {"vertical_max", 235}};
+    QJsonObject status{{"type", "status"}, {"seq", 1}, {"online", true}, {"mode", 0},
+                       {"horizontal", -60}, {"vertical", 200}, {"calibration", calibration}};
+    reply(status);
+    QTRY_COMPARE(profiles.size(), 1);
+    QVERIFY(profiles.last()[0].toBool());
+    QCOMPARE(profiles.last()[1].toFloat(), 40.0f);
+    QCOMPARE(profiles.last()[2].toFloat(), 200.0f);
+    status.insert("seq", 2);
+    status.remove("calibration");
+    reply(status);
+    QTRY_COMPARE(profiles.size(), 2);
+    QVERIFY(!profiles.last()[0].toBool());
+    status.insert("seq", 1);
+    status.insert("calibration", calibration);
+    reply(status);
+    QTest::qWait(100);
+    QCOMPARE(profiles.size(), 2);
+    status.insert("seq", 3);
+    auto invalid = calibration;
+    invalid.insert("horizontal", 80);
+    status.insert("calibration", invalid);
+    reply(status);
+    QTRY_COMPARE(profiles.size(), 3);
+    QVERIFY(!profiles.last()[0].toBool());
+    control.disconnectDevice();
+}
+
+void NetworkControllerTest::variableManualStepPreservesSelectionAcrossRetriesAndQueue()
+{
+    QUdpSocket server;
+    QVERIFY(server.bind(QHostAddress(QHostAddress::LocalHost), quint16(0)));
+    NetworkController control;
+    control.setAuthKey({});
+    QSignalSpy failed(&control, &NetworkController::commandFailed);
+    control.connectToDevice(QStringLiteral("127.0.0.1"), server.localPort());
+    QTRY_VERIFY(server.hasPendingDatagrams());
+    const auto hello = server.receiveDatagram();
+    const auto session = QJsonDocument::fromJson(hello.data()).object().value("session").toString();
+    auto reply = [&](QJsonObject message) {
+        message.insert("version", 1); message.insert("session", session);
+        server.writeDatagram(QJsonDocument(message).toJson(QJsonDocument::Compact),
+                             hello.senderAddress(), hello.senderPort());
+    };
+    reply({{"type", "welcome"}});
+    QTRY_VERIFY(control.isConnected());
+    reply({{"type", "status"}, {"seq", 1}, {"online", true}, {"mode", 0}, {"horizontal", 0}, {"vertical", 0}});
+    QTRY_VERIFY(control.isOpen());
+    control.sendManualStep(NetworkController::CmdManualUp, 1);
+    control.sendManualStep(NetworkController::CmdManualRight, 100);
+    QTRY_VERIFY(server.hasPendingDatagrams());
+    const auto first = QJsonDocument::fromJson(server.receiveDatagram().data()).object();
+    QCOMPARE(first.value("type").toString(), QStringLiteral("manual_step"));
+    QCOMPARE(first.value("step_tenths").toInt(), 1);
+    QTest::qWait(350);
+    bool retried = false;
+    while (server.hasPendingDatagrams()) {
+        const auto message = QJsonDocument::fromJson(server.receiveDatagram().data()).object();
+        if (message.value("type").toString() == QStringLiteral("manual_step")) {
+            QCOMPARE(message, first);
+            retried = true;
+        }
+    }
+    QVERIFY(retried);
+    reply({{"type", "ack"}, {"request", first.value("request")}, {"cmd", NetworkController::CmdManualUp}});
+    QTRY_VERIFY(server.hasPendingDatagrams());
+    const auto second = QJsonDocument::fromJson(server.receiveDatagram().data()).object();
+    QCOMPARE(second.value("cmd").toInt(), int(NetworkController::CmdManualRight));
+    QCOMPARE(second.value("step_tenths").toInt(), 100);
+    control.sendManualStep(NetworkController::CmdManualUp, 0);
+    control.sendManualStep(NetworkController::CmdManualUp, 101);
+    control.sendManualStep(NetworkController::CmdCenter, 5);
+    QCOMPARE(failed.size(), 3);
+    control.disconnectDevice();
+}
 
 namespace {
 const QByteArray kKey = QByteArray::fromHex("00112233445566778899aabbccddeeff00112233445566778899aabbccddeeff");

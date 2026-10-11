@@ -1,0 +1,50 @@
+#!/bin/sh
+# A small native watcher reapplies video QoS when rkipc creates/reopens sockets.
+PIDFILE=/var/run/luckfox-video-qos.pid
+BINARY=/oem/usr/bin/luckfox-video-qos
+LOG=/tmp/luckfox-video-qos.log
+ENABLE_FILE=/userdata/cfg/enable-video-qos
+running() {
+    [ -f "$PIDFILE" ] || return 1
+    qos_pid=$(cat "$PIDFILE")
+    case "$qos_pid" in ''|*[!0-9]*) return 1 ;; esac
+    [ -r "/proc/$qos_pid/cmdline" ] || return 1
+    tr '\000' '\n' < "/proc/$qos_pid/cmdline" | grep -Fxq -- "$BINARY"
+}
+case "$1" in
+start)
+    # AF41/WMM depends on the AP and driver. Keep default priority until
+    # this explicit opt-in marker has been enabled after a link comparison.
+    if [ ! -f "$ENABLE_FILE" ]; then
+        "$0" stop || exit 1
+        echo "video-qos: disabled (default socket priority)"
+        exit 0
+    fi
+    running && exit 0
+    [ -x "$BINARY" ] || { echo "video-qos: native helper is not installed"; exit 1; }
+    rm -f "$PIDFILE"
+    # BusyBox start-stop-daemon -b closes redirected stdout/stderr. Keep the
+    # native helper's startup failures and socket updates available in LOG.
+    nohup "$BINARY" >>"$LOG" 2>&1 </dev/null &
+    qos_started_pid=$!
+    printf '%s\n' "$qos_started_pid" >"$PIDFILE"
+    sleep 1
+    running || { echo "video-qos: start failed; check $LOG"; exit 1; }
+    ;;
+stop)
+    if running; then
+        kill "$qos_pid" || exit 1
+        for qos_wait in 1 2 3; do running || break; sleep 1; done
+        running && { echo "video-qos: stop timed out"; exit 1; }
+    fi
+    rm -f "$PIDFILE"
+    # Stopping the watcher alone leaves existing sockets marked with AF41.
+    [ ! -x "$BINARY" ] || "$BINARY" --restore || exit 1
+    ;;
+restart) "$0" stop && "$0" start ;;
+status)
+    running && { echo "video-qos: running"; exit 0; }
+    [ -f "$ENABLE_FILE" ] || { echo "video-qos: disabled (default socket priority)"; exit 0; }
+    echo "video-qos: stopped"; exit 1 ;;
+*) echo "usage: $0 {start|stop|restart|status}"; exit 1 ;;
+esac

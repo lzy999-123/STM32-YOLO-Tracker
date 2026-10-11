@@ -105,15 +105,14 @@ void CameraManager::startRtspStream(const QString &url)
 
 void CameraManager::stopRtspStream()
 {
-    m_rtspSessionId.fetch_add(1); // 递增会话ID，旧线程在当前帧或下次循环检查时立即退出
-    m_rtspRunning.store(false);
-
     {
         std::lock_guard<std::mutex> lock(m_rtspMatMutex);
+        m_rtspSessionId.fetch_add(1);
+        m_rtspRunning.store(false);
         m_latestRtspMat.release();
         m_hasNewRtspMat.store(false, std::memory_order_release);
+        m_rtspDispatchPending.store(false, std::memory_order_release);
     }
-    m_rtspDispatchPending.store(false, std::memory_order_release);
 
     if (m_rtspThread) {
         if (m_rtspThread->joinable()) {
@@ -131,20 +130,31 @@ void CameraManager::stopRtspStream()
 
 void CameraManager::notifyNewMat(quint64 sessionId)
 {
-    if (sessionId != m_rtspSessionId.load()) {
-        return; // 已经切换到新视频流，废弃旧流残留通知！
-    }
-    m_rtspDispatchPending.store(false, std::memory_order_release);
-
     cv::Mat mat;
     {
         std::lock_guard<std::mutex> lock(m_rtspMatMutex);
+        if (sessionId != m_rtspSessionId.load()) return;
+        m_rtspDispatchPending.store(false, std::memory_order_release);
         if (!m_hasNewRtspMat.load(std::memory_order_acquire)) return;
         mat = m_latestRtspMat;
         m_hasNewRtspMat.store(false, std::memory_order_release);
     }
     if (!mat.empty() && sessionId == m_rtspSessionId.load()) {
         emit matReady(mat);
+    }
+}
+
+void CameraManager::publishRtspFrame(cv::Mat frame, quint64 sessionId)
+{
+    std::lock_guard<std::mutex> lock(m_rtspMatMutex);
+    if (!m_rtspRunning.load() || sessionId != m_rtspSessionId.load()) return;
+    m_latestRtspMat = std::move(frame);
+    m_hasNewRtspMat.store(true, std::memory_order_release);
+    // 发布、旧会话作废和通知登记使用同一把锁，防止关闭后旧通知挡住新流。
+    if (!m_rtspDispatchPending.exchange(true)) {
+        QMetaObject::invokeMethod(this, [this, sessionId]() {
+            notifyNewMat(sessionId);
+        }, Qt::QueuedConnection);
     }
 }
 
@@ -329,20 +339,7 @@ void CameraManager::rtspWorkerLoop(const QString &url, quint64 sessionId,
 
         if (sessionId != m_rtspSessionId.load()) break;
 
-        // 存入最新帧（移动语义，零冗余拷贝）
-        {
-            std::lock_guard<std::mutex> lock(m_rtspMatMutex);
-            if (sessionId != m_rtspSessionId.load()) break;
-            m_latestRtspMat = std::move(frame);
-            m_hasNewRtspMat.store(true, std::memory_order_release);
-        }
-
-        bool expected = false;
-        if (m_rtspDispatchPending.compare_exchange_strong(expected, true)) {
-            QMetaObject::invokeMethod(this, [this, sessionId]() {
-                notifyNewMat(sessionId);
-            }, Qt::QueuedConnection);
-        }
+        publishRtspFrame(std::move(frame), sessionId);
     }
 
     cap.release();

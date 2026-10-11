@@ -133,6 +133,9 @@ private:
     /// @brief 停止 RTSP 网络流拉流
     void stopRtspStream();
 
+    /// @brief 同一会话内覆盖最新帧并登记一次 GUI 通知。
+    void publishRtspFrame(cv::Mat frame, quint64 sessionId);
+
     /// @brief RTSP 后台取流线程主循环；退出时把 finished 置为 true
     void rtspWorkerLoop(const QString &url, quint64 sessionId,
                         std::shared_ptr<std::atomic<bool>> finished);

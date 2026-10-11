@@ -1,6 +1,9 @@
 import importlib.util
 import json
+import os
 from pathlib import Path
+import select
+import socket
 import struct
 import tempfile
 import unittest
@@ -48,6 +51,80 @@ class ControlBridgeTests(unittest.TestCase):
         replies = [json.loads(data) for data, _ in self.engine.drain()]
         self.assertTrue(any(x['type'] == 'command_failed' for x in replies))
 
+    def test_variable_manual_steps_encode_and_deduplicate(self):
+        self.online()
+        request = 0
+        for cmd in sorted(bridge.MANUAL_COMMANDS):
+            for step in (1, 5, 25, 100):
+                request += 1
+                expected = bridge.frame(4, struct.pack('>BH', cmd, step))
+                count = len(self.writes)
+                self.send('manual_step', request=request, cmd=cmd, step_tenths=step)
+                self.send('manual_step', request=request, cmd=cmd, step_tenths=step)
+                self.assertEqual(self.writes[count:], [expected])
+                self.engine.uart_frame(0x82, bytes((cmd,)))
+                original = self.engine.drain()
+                self.send('manual_step', request=request, cmd=cmd, step_tenths=step)
+                self.assertEqual(self.engine.drain(), original)
+                self.assertEqual(self.writes[count:], [expected])
+
+    def test_variable_step_rejects_bad_range_type_and_command(self):
+        self.online()
+        for step in (None, True, 0, -1, 101, 65535, 1.5, '5'):
+            self.send('manual_step', request=1, cmd=0x20, step_tenths=step)
+        self.send('manual_step', request=1, cmd=0x02, step_tenths=5)
+        self.assertEqual(self.writes, [])
+        self.assertEqual(self.engine.command_highwater, 0)
+        self.assertIsNone(self.engine.pending)
+
+    def test_variable_step_without_firmware_ack_fails_without_legacy_fallback(self):
+        self.online()
+        self.send('manual_step', request=1, cmd=0x22, step_tenths=100)
+        self.now += .5
+        self.engine.tick()
+        self.send('manual_step', request=1, cmd=0x22, step_tenths=100)
+        steps = [(kind, payload) for data in self.writes
+                 for kind, payload in bridge.FrameParser().feed(data) if kind in (2, 4)]
+        self.assertEqual(steps, [(4, struct.pack('>BH', 0x22, 100))])
+        self.assertTrue(any(json.loads(data)['type'] == 'command_failed'
+                            for data, _ in self.engine.drain()))
+
+    def test_calibration_reference_and_ranges_are_reported_from_uart(self):
+        self.online()
+        packet = bridge.frame(0x83, struct.pack('>Bhhhhhh', 3, 400, 2000, -600, 700, 1400, 2350))
+        for kind, payload in bridge.FrameParser().feed(packet):
+            self.engine.uart_frame(kind, payload)
+        self.engine.tick()
+        status = [json.loads(data) for data, _ in self.engine.drain()
+                  if json.loads(data)['type'] == 'status'][-1]
+        self.assertEqual(status['calibration'], dict(valid=True, horizontal=40.0, vertical=200.0,
+                         horizontal_min=-60.0, horizontal_max=70.0, vertical_min=140.0, vertical_max=235.0))
+        self.assertEqual(status['horizontal'], 90.0)  # Reference is independent of measured angles.
+
+    def test_calibration_missing_invalid_and_expired_never_become_default_values(self):
+        self.online()
+        for payload in (b'', b'\x03', struct.pack('>Bhhhhhh', 4, 400, 2000, -600, 700, 1400, 2350),
+                        struct.pack('>Bhhhhhh', 3, 800, 2000, -600, 700, 1400, 2350)):
+            self.engine.uart_frame(0x83, payload)
+            self.assertIsNone(self.engine.calibration)
+        self.engine.tick()
+        status = [json.loads(data) for data, _ in self.engine.drain()
+                  if json.loads(data)['type'] == 'status'][-1]
+        self.assertIsNone(status['calibration'])
+        self.engine.uart_frame(0x83, struct.pack('>Bhhhhhh', 1, 400, 2000, -600, 700, 1400, 2350))
+        self.assertFalse(self.engine.calibration['valid'])
+        self.engine.uart_frame(0x83, struct.pack('>Bhhhhhh', 3, 400, 2000, -600, 700, 1400, 2350))
+        # Keep the client lease and telemetry fresh while only the profile expires.
+        for _ in range(6):
+            self.now += .45
+            self.send('heartbeat')
+            self.online()
+            self.engine.tick()
+        status = [json.loads(data) for data, _ in self.engine.drain()
+                  if json.loads(data)['type'] == 'status'][-1]
+        self.assertTrue(status['online'])
+        self.assertIsNone(status['calibration'])
+
     def test_newest_coordinates_win_and_expired_coordinates_stop(self):
         self.online()
         self.send('track', seq=2, x=-100, y=50)
@@ -58,6 +135,19 @@ class ControlBridgeTests(unittest.TestCase):
         self.now += .21
         self.engine.tick()
         self.assertFalse(any(bridge.FrameParser().feed(x)[0][0] == 1 for x in self.writes[count:]))
+
+    def test_tracking_direction_signs_are_preserved_in_uart(self):
+        self.online()
+        # Installation-corrected image: positive X is right, positive Y is down.
+        for seq, (x, y) in enumerate(((0, 80), (0, -80), (80, 0), (-80, 0),
+                                     (0, 0), (-32768, 32767)), start=1):
+            with self.subTest(x=x, y=y):
+                self.now += .025
+                self.send('track', seq=seq, x=x, y=y)
+                self.engine.tick()
+                frames = [packet for data in self.writes
+                          for packet in bridge.FrameParser().feed(data) if packet[0] == 1]
+                self.assertEqual(struct.unpack('>hh', frames[-1][1]), (x, y))
 
     def test_network_loss_stops_tracking_without_recenter_and_stops_uart_heartbeat(self):
         self.online()
@@ -93,6 +183,22 @@ class ControlBridgeTests(unittest.TestCase):
         self.assertFalse(status[-1]['online'])
         self.send('command', request=1, cmd=0x11)
         self.assertNotIn(bridge.frame(2, b'\x11'), self.writes)
+
+    def test_measured_angles_beyond_command_limits_keep_updating(self):
+        parser = bridge.FrameParser()
+        for horizontal, vertical in ((1800, -1800), (2000, -2250), (2100, -2300), (32767, -32768)):
+            # Actual UART bytes and CRC must survive decoding and network forwarding.
+            packet = bridge.frame(0x81, struct.pack('>BhhB', 0, horizontal, vertical, 0))
+            for kind, payload in parser.feed(packet):
+                self.engine.uart_frame(kind, payload)
+            self.send('heartbeat')
+            self.engine.tick()
+            statuses = [json.loads(data) for data, _ in self.engine.drain()
+                        if json.loads(data)['type'] == 'status']
+            self.assertTrue(statuses[-1]['online'])
+            self.assertEqual(statuses[-1]['horizontal'], horizontal / 10.0)
+            self.assertEqual(statuses[-1]['vertical'], vertical / 10.0)
+            self.now += .11
 
     def test_expired_session_cannot_be_reopened_by_delayed_hello(self):
         self.now += 1.01
@@ -291,11 +397,56 @@ class UartRecoveryTests(unittest.TestCase):
 
 
 class ServeLoopTests(unittest.TestCase):
+    def test_shared_discovery_preserves_uart_status_and_closes_with_control(self):
+        self.check_shared_loop(False)
+
+    def test_discovery_bind_failure_does_not_interrupt_uart_or_control(self):
+        self.check_shared_loop(True)
+
+    def check_shared_loop(self, bind_failure):
+        server, uart, responder = mock.Mock(), mock.Mock(), mock.Mock()
+        server.getsockopt.return_value = bridge.CONTROL_TOS
+        server.recvfrom.return_value = (
+            json.dumps(dict(type='hello', version=1, session='shared')).encode(), ('127.0.0.1', 12345))
+        uart.fd.return_value = 42
+        uart.read.return_value = [(0x81, struct.pack('>Bhh', 1, 900, 850))]
+        iterations = []
+
+        def ready_once(read, write, error, timeout):
+            iterations.append(list(read))
+            if len(iterations) > 1:
+                raise KeyboardInterrupt
+            return list(read), [], []
+
+        with mock.patch.object(bridge.socket, 'socket', return_value=server), \
+                mock.patch.object(bridge, 'UartLink', return_value=uart), \
+                mock.patch.object(bridge, 'open_embedded_discovery', return_value=responder,
+                                  side_effect=OSError('address in use') if bind_failure else None), \
+                mock.patch.object(bridge.select, 'select', ready_once), \
+                mock.patch.object(bridge, 'log'):
+            with self.assertRaises(KeyboardInterrupt):
+                bridge.serve({'uart': '/dev/ttyS2', 'embedded_discovery': True}, None)
+        replies = [json.loads(call.args[0]) for call in server.sendto.call_args_list]
+        self.assertTrue(any(packet['type'] == 'welcome' for packet in replies))
+        self.assertTrue(any(packet['type'] == 'status' and packet['online'] for packet in replies))
+        uart.read.assert_called_once()
+        uart.close.assert_called_once()
+        server.close.assert_called_once()
+        if bind_failure:
+            self.assertEqual(iterations[0], [server, 42])
+            responder.poll.assert_not_called()
+        else:
+            self.assertEqual(iterations[0], [server, 42, responder.server])
+            responder.poll.assert_called_once()
+            responder.close.assert_called_once()
+
     def test_sendto_and_uart_errors_do_not_stop_loop(self):
         calls = {'select': 0, 'sendto': 0}
 
         class Socket:
             def bind(self, address): pass
+            def setsockopt(self, *arguments): pass
+            def getsockopt(self, *arguments): return bridge.CONTROL_TOS
             def close(self): pass
             def recvfrom(self, size):
                 return json.dumps(dict(type='hello', version=1, session='x')).encode(), ('127.0.0.1', 1)
@@ -330,6 +481,58 @@ spec_discovery.loader.exec_module(discovery)
 
 
 class DiscoveryTests(unittest.TestCase):
+    def test_shared_responder_uses_same_signed_and_unsigned_udp_protocol(self):
+        with tempfile.TemporaryDirectory() as root:
+            marker = Path(root, 'integrated.pid')
+            for key in (None, KEY):
+                responder = discovery.Responder({'device_id': 'luckfox-test', 'bind_address': '127.0.0.1'},
+                                                key, str(marker), port=0)
+                client = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
+                client.settimeout(.5)
+                try:
+                    self.assertEqual(marker.read_text().strip(), str(os.getpid()))
+                    request = json.dumps(dict(type='luckfox-discover', version=1, nonce='shared-nonce')).encode()
+                    client.sendto(request, responder.server.getsockname())
+                    self.assertTrue(select.select([responder.server], [], [], .5)[0])
+                    responder.poll()
+                    answer = bridge.unseal(client.recvfrom(1200)[0], key)
+                    self.assertEqual(answer, dict(type='luckfox-camera', version=1, nonce='shared-nonce',
+                                                 device_id='luckfox-test', rtsp_port=554, path='/live/0'))
+                finally:
+                    client.close()
+                    responder.close()
+                self.assertFalse(marker.exists())
+
+    def test_shared_responder_rejects_invalid_and_oversized_requests(self):
+        responder = discovery.Responder({'device_id': 'luckfox-test', 'bind_address': '127.0.0.1'}, None, port=0)
+        client = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
+        client.settimeout(.02)
+        request = json.dumps(dict(type='luckfox-discover', version=1, nonce='n')).encode()
+        try:
+            for packet in (b'\xff', b'[]', b'{}', request + b' ' * (513 - len(request))):
+                client.sendto(packet, responder.server.getsockname())
+                self.assertTrue(select.select([responder.server], [], [], .5)[0])
+                responder.poll()
+                with self.assertRaises(socket.timeout):
+                    client.recvfrom(1200)
+        finally:
+            client.close()
+            responder.close()
+
+    def test_failed_bind_and_close_do_not_remove_another_owner_marker(self):
+        with tempfile.TemporaryDirectory() as root:
+            marker = Path(root, 'integrated.pid')
+            config = {'device_id': 'luckfox-test', 'bind_address': '127.0.0.1'}
+            responder = discovery.Responder(config, None, str(marker), port=0)
+            try:
+                with self.assertRaises(OSError):
+                    discovery.Responder(config, None, str(marker), port=responder.server.getsockname()[1])
+                self.assertEqual(marker.read_text().strip(), str(os.getpid()))
+                marker.write_text('999999\n')
+            finally:
+                responder.close()
+            self.assertEqual(marker.read_text(), '999999\n')
+
     def test_signed_answer_and_missing_eth0(self):
         request = json.dumps(dict(type='luckfox-discover', version=1, nonce='n1')).encode()
         self.assertEqual(json.loads(discovery.answer(request, 'luckfox-1', None))['nonce'], 'n1')

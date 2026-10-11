@@ -11,7 +11,9 @@ import sys
 import time
 
 COMMANDS = {0x01, 0x02, 0x11, 0x12, 0x20, 0x21, 0x22, 0x23}
+MANUAL_COMMANDS = {0x20, 0x21, 0x22, 0x23}
 PORT = 5005
+CONTROL_TOS = 0xe0  # CS7；RTL8188EU 对应 WMM 优先级 7，高于视频的 4。
 LEASE = 1.0
 ACK_TIMEOUT = .45
 FORWARD_INTERVAL = .02
@@ -128,6 +130,8 @@ class Bridge:
         self.session = None
         self.last_client = 0
         self.last_telemetry = -100
+        self.last_calibration = -100
+        self.calibration = None
         self.last_heartbeat = -100
         self.last_status = -100
         self.last_forward = -100
@@ -203,10 +207,16 @@ class Bridge:
                 return
             self.last_client, self.track_seq = now, seq
             self.track = (x, y, now)
-        elif kind == 'command':
+        elif kind in ('command', 'manual_step'):
             request, cmd = message.get('request'), message.get('cmd')
             if not integer(request, 1, 0xffffffff) or not integer(cmd, 0, 255) or cmd not in COMMANDS:
                 return
+            uart_kind, payload = 2, bytes((cmd,))
+            if kind == 'manual_step':
+                step = message.get('step_tenths')
+                if cmd not in MANUAL_COMMANDS or not integer(step, 1, 100):
+                    return
+                uart_kind, payload = 4, struct.pack('>BH', cmd, step)
             self.last_client = now
             if request in self.completed:
                 old_cmd, result = self.completed[request]
@@ -222,7 +232,7 @@ class Bridge:
             if cmd in (0x01, 0x02, 0x11, 0x12):
                 self.track = None
             self.pending = (request, cmd, now)
-            self.write_uart(frame(2, bytes((cmd,))))
+            self.write_uart(frame(uart_kind, payload))
 
     def finish_command(self, request, cmd, result):
         self.completed[request] = (cmd, result)
@@ -240,6 +250,15 @@ class Bridge:
             self.mode, self.horizontal, self.vertical = mode, horizontal / 10.0, vertical / 10.0
             self.flags = payload[5] if len(payload) == 6 else 0
             self.last_telemetry = self.clock()
+        elif kind == 0x83 and len(payload) == 13:
+            mask, horizontal, vertical, h_min, h_max, v_min, v_max = struct.unpack('>Bhhhhhh', payload)
+            if mask > 3 or not h_min <= horizontal <= h_max or not v_min <= vertical <= v_max:
+                return
+            self.calibration = dict(valid=mask == 3, horizontal=horizontal / 10.0,
+                                    vertical=vertical / 10.0, horizontal_min=h_min / 10.0,
+                                    horizontal_max=h_max / 10.0, vertical_min=v_min / 10.0,
+                                    vertical_max=v_max / 10.0)
+            self.last_calibration = self.clock()
         elif kind == 0x82 and len(payload) == 1 and self.pending is not None:
             request, cmd, _ = self.pending
             if payload[0] == cmd:
@@ -270,8 +289,11 @@ class Bridge:
                 self.track = None
         if now - self.last_status >= .1:
             self.status_seq += 1
+            if now - self.last_telemetry > 1.0 or now - self.last_calibration > 2.5:
+                self.calibration = None
             self.reply('status', seq=self.status_seq, online=now - self.last_telemetry <= 1.0,
-                       mode=self.mode, horizontal=self.horizontal, vertical=self.vertical, flags=self.flags)
+                       mode=self.mode, horizontal=self.horizontal, vertical=self.vertical, flags=self.flags,
+                       calibration=self.calibration)
             self.last_status = now
 
 
@@ -390,18 +412,43 @@ class UartLink:
                 pass
 
 
+def open_embedded_discovery(config, auth_key):
+    # 复用现有发现协议；只有显式开启时才加载，兼容旧部署和独立发现服务。
+    import importlib.util
+    path = os.path.join(os.path.dirname(os.path.abspath(__file__)), 'luckfox-discovery.py')
+    spec = importlib.util.spec_from_file_location('luckfox_discovery', path)
+    module = importlib.util.module_from_spec(spec)
+    spec.loader.exec_module(module)
+    return module.Responder(config, auth_key, pidfile=module.INTEGRATED_PIDFILE)
+
+
 def serve(config, auth_key):
     uart = UartLink(config['uart'], config.get('baud', 115200))
     engine = Bridge(uart.write, auth_key=auth_key)
     server = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
+    discovery = None
     try:
         address = config.get('bind_address', '0.0.0.0')
         server.bind((address, PORT))
+        try:
+            server.setsockopt(socket.IPPROTO_IP, socket.IP_TOS, CONTROL_TOS)
+            log('控制数据优先级 IP_TOS=0x%02x' % server.getsockopt(socket.IPPROTO_IP, socket.IP_TOS))
+        except OSError as error:
+            log('无法设置控制数据优先级，继续使用现有通道：%s' % error)
         log('控制桥接已启动，UDP %s:%s -> %s' % (address, PORT, config['uart']))
+        if config.get('embedded_discovery', False):
+            try:
+                discovery = open_embedded_discovery(config, auth_key)
+                log('发现服务共用控制进程，UDP %s:39093' % address)
+            except (OSError, ValueError, ImportError) as error:
+                # 发现端口异常不能中断已经工作的 UART/控制服务。
+                log('内嵌发现启动失败：%s；可使用独立发现服务' % error)
         while True:
             uart.ensure_open()
             uart_fd = uart.fd()
             sources = [server] if uart_fd is None else [server, uart_fd]
+            if discovery is not None:
+                sources.append(discovery.server)
             ready, _, _ = select.select(sources, [], [], .01)
             if server in ready:
                 try:
@@ -413,6 +460,8 @@ def serve(config, auth_key):
             if uart_fd is not None and uart_fd in ready:
                 for kind, payload in uart.read():
                     engine.uart_frame(kind, payload)
+            if discovery is not None and discovery.server in ready:
+                discovery.poll()
             engine.tick()
             for data, peer in engine.drain():
                 try:
@@ -425,6 +474,8 @@ def serve(config, auth_key):
         finally:
             uart.close()
             server.close()
+            if discovery is not None:
+                discovery.close()
 
 
 def load_config(path):
@@ -435,6 +486,8 @@ def load_config(path):
     check_uart_config(config['uart'], config.get('baud', 115200))
     if not isinstance(config.get('bind_address', '0.0.0.0'), str):
         raise ValueError('bind_address 必须是 IPv4 地址字符串')
+    if type(config.get('embedded_discovery', False)) is not bool:
+        raise ValueError('embedded_discovery 必须是布尔值')
     return config, parse_key(config.get('auth_key'))
 
 

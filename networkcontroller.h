@@ -23,11 +23,13 @@ public:
     // STM32 遥测 flags（TELEMETRY 第 6 字节；旧固件为 0）。
     enum TelemetryFlag { FlagFault = 0x01, FlagEmergencyStop = 0x02, FlagLinkLost = 0x04 };
     explicit NetworkController(QObject *parent = nullptr);
+    ~NetworkController() override;
     void connectToDevice(const QString &address, quint16 port = 5005);
     void disconnectDevice();
     bool isOpen() const { return m_connected && m_online; }
     bool isConnected() const { return m_connected; }
     void sendCommand(uint8_t cmd);
+    void sendManualStep(uint8_t cmd, quint16 stepTenths);
     void sendTrackData(int16_t offsetX, int16_t offsetY);
     void shutdownGimbal();
     int telemetryFlags() const { return m_flags; }
@@ -44,13 +46,16 @@ public:
     static bool openMessage(const QByteArray &datagram, const QByteArray &key, QByteArray *inner);
 signals:
     void telemetryReceived(int mode, float horizontalAngle, float verticalAngle);
+    void calibrationReceived(bool valid, float horizontal, float vertical,
+                             float horizontalMin, float horizontalMax,
+                             float verticalMin, float verticalMax);
     void commandFailed(uint8_t cmd);
     void connectionLost(const QString &reason);
     void reconnected();
     void deviceOnlineChanged(bool online);
     void telemetryFlagsChanged(int flags);
 private:
-    struct PendingCommand { quint32 request; uint8_t cmd; int retries = 0; };
+    struct PendingCommand { quint32 request; uint8_t cmd; int retries = 0; quint16 stepTenths = 0; };
     void send(QJsonObject message);
     void receive();
     void tick();
@@ -58,6 +63,9 @@ private:
     void setOnline(bool online);
     void loseConnection(const QString &reason);
     void setFlags(int flags);
+    void configureTrafficPriority();
+    void releaseTrafficPriority();
+    void *m_qosHandle = nullptr;
     QUdpSocket m_socket;
     QTimer m_timer;
     QElapsedTimer m_clock;

@@ -1,8 +1,26 @@
 #!/bin/sh
+PIDFILE=/var/run/luckfox-wifi.pid
+DHCP_PIDFILE=/var/run/udhcpc-wlan0.pid
+LOG=/tmp/luckfox-wifi-start.log
+SELF=$(readlink -f "$0" 2>/dev/null) || SELF=$0
+
+pid_matches() {
+    [ -f "$1" ] || return 1
+    check_pid=$(cat "$1")
+    case "$check_pid" in ''|*[!0-9]*) return 1 ;; esac
+    [ -r "/proc/$check_pid/cmdline" ] || return 1
+    shift
+    for check_arg in "$@"; do
+        tr '\000' '\n' < "/proc/$check_pid/cmdline" | grep -Fxq -- "$check_arg" || return 1
+    done
+}
+running() { pid_matches "$PIDFILE" "$SELF" supervise; }
+
 load_module() {
     [ -d "/sys/module/$1" ] || insmod "$2"
 }
-load_wifi() {
+load_modules() (
+    # A subshell restores modprobe on every return, including module errors.
     helper=$(cat /proc/sys/kernel/modprobe)
     trap 'echo "$helper" > /proc/sys/kernel/modprobe' EXIT HUP INT TERM
     echo /bin/true > /proc/sys/kernel/modprobe
@@ -18,12 +36,109 @@ load_wifi() {
     if [ ! -d /sys/module/r8188eu ]; then
         insmod /userdata/wifi-driver/r8188eu.ko rtw_power_mgnt=0 rtw_enusbss=0 rtw_ips_mode=0 || return 1
     fi
+)
+supplicant_running() {
+    for supplicant_pid in $(ps | awk '/[w]pa_supplicant/ {print $1}'); do
+        [ -r "/proc/$supplicant_pid/cmdline" ] || continue
+        supplicant_args=$(tr '\000' '\n' < "/proc/$supplicant_pid/cmdline")
+        printf '%s\n' "$supplicant_args" | grep -Eq '(^|/)wpa_supplicant$' || continue
+        printf '%s\n' "$supplicant_args" | grep -Fxq -- wlan0 || continue
+        return 0
+    done
+    return 1
+}
+ensure_supplicant() {
     ip link set wlan0 up || return 1
     mkdir -p /var/run/wpa_supplicant
+    # Scanning/reconfiguration may delay PONG; never start a second live daemon.
+    supplicant_running && return 0
     if ! wpa_cli -i wlan0 ping 2>/dev/null | grep -q PONG; then
         rm -f /var/run/wpa_supplicant/wlan0
         nohup wpa_supplicant -i wlan0 -D wext -c /userdata/cfg/wpa_supplicant.conf -C /var/run/wpa_supplicant >/tmp/luckfox-wpa.log 2>&1 </dev/null &
     fi
+}
+dhcp_pids() {
+    # Select only this interface; a stale PID file must never kill another process.
+    for dhcp_pid in $(ps | awk '/[u]dhcpc/ {print $1}'); do
+        [ -r "/proc/$dhcp_pid/cmdline" ] || continue
+        dhcp_args=$(tr '\000' '\n' < "/proc/$dhcp_pid/cmdline")
+        printf '%s\n' "$dhcp_args" | grep -Eq '(^|/)udhcpc$' || continue
+        printf '%s\n' "$dhcp_args" | grep -Fxq -- '-i' || continue
+        printf '%s\n' "$dhcp_args" | grep -Fxq -- "$1" || continue
+        echo "$dhcp_pid"
+    done
+}
+stop_dhcp() {
+    for dhcp_pid in $(dhcp_pids wlan0); do
+        kill "$dhcp_pid" 2>/dev/null
+    done
+    rm -f "$DHCP_PIDFILE"
+}
+ensure_dhcp() {
+    dhcp_existing=$(dhcp_pids wlan0)
+    if [ -n "$dhcp_existing" ]; then
+        printf '%s\n' "$dhcp_existing" | head -1 > "$DHCP_PIDFILE"
+        return 0
+    fi
+    nohup udhcpc -f -i wlan0 -p "$DHCP_PIDFILE" -t 5 -T 3 -A 5 >/tmp/luckfox-wifi-dhcp.log 2>&1 </dev/null &
+}
+restore_wired() {
+    for dhcp_pid in $(dhcp_pids eth0); do
+        kill "$dhcp_pid" 2>/dev/null
+    done
+    ifconfig eth0 192.168.8.93 netmask 255.255.255.0 up
+}
+pause_wifi() {
+    sleep "$1" &
+    sleep_pid=$!
+    wait "$sleep_pid"
+    sleep_pid=
+}
+monitor_wifi() {
+    sleep_pid=
+    trap '[ -z "$sleep_pid" ] || kill "$sleep_pid" 2>/dev/null; exit 0' TERM INT
+    pause_wifi 35
+    until load_modules; do
+        echo 'wifi: module setup failed; retry in 5s'
+        pause_wifi 5
+    done
+    previous_network=
+    first_connection=yes
+    while :; do
+        if ! wpa_cli -i wlan0 ping 2>/dev/null | grep -q PONG; then
+            ensure_supplicant
+        fi
+        wifi_status=$(wpa_cli -i wlan0 status 2>/dev/null)
+        if printf '%s\n' "$wifi_status" | grep -q '^wpa_state=COMPLETED$'; then
+            current_network=$(printf '%s\n' "$wifi_status" | awk '/^(id|bssid)=/ {print}')
+            if [ "$first_connection" = yes ]; then
+                # rkipc restarts DHCP after the first association during boot.
+                pause_wifi 15
+                first_connection=no
+                continue
+            fi
+            if [ "$current_network" != "$previous_network" ]; then
+                # A new AP may use a different subnet; discard the old lease.
+                stop_dhcp
+                ip -4 addr flush dev wlan0
+                ip -4 route flush dev wlan0
+                restore_wired
+                previous_network=$current_network
+                echo 'wifi: associated; requesting a fresh DHCP lease'
+            fi
+            ensure_dhcp
+        else
+            if [ -n "$previous_network" ]; then
+                previous_network=
+                echo 'wifi: disconnected; waiting for a configured network'
+            fi
+        fi
+        pause_wifi 2
+    done
+}
+load_wifi() {
+    load_modules || return 1
+    ensure_supplicant || return 1
     attempt=0
     while [ "$attempt" -lt 40 ]; do
         wpa_cli -i wlan0 status 2>/dev/null | grep -q 'wpa_state=COMPLETED' && break
@@ -33,26 +148,30 @@ load_wifi() {
     wpa_cli -i wlan0 status 2>/dev/null | grep -q 'wpa_state=COMPLETED' || return 1
     # The camera service restarts DHCP clients when Wi-Fi first connects.
     sleep 15
-    for pid in $(ps | awk '/[u]dhcpc.*-i eth0/ {print $1}'); do
-        kill "$pid" 2>/dev/null
-    done
-    ifconfig eth0 192.168.8.93 netmask 255.255.255.0 up
-    if ! ps | grep '[u]dhcpc.*wlan0' >/dev/null; then
-        nohup udhcpc -f -i wlan0 -p /var/run/udhcpc-wlan0.pid -t 5 -T 3 >/tmp/luckfox-wifi-dhcp.log 2>&1 </dev/null &
-        sleep 1
-    fi
+    restore_wired
+    ensure_dhcp
     echo "Wi-Fi authenticated; DHCP started"
 }
 case "$1" in
 start)
-    (sleep 35; load_wifi) >/tmp/luckfox-wifi-start.log 2>&1 &
+    running && exit 0
+    rm -f "$PIDFILE"
+    start-stop-daemon -S -b -m -p "$PIDFILE" -x /bin/sh -- -c 'exec /bin/sh "$1" supervise >>"$2" 2>&1 </dev/null' wifi "$SELF" "$LOG" || exit 1
+    echo 'wifi: background monitor started'
     ;;
+supervise) monitor_wifi ;;
 test) load_wifi ;;
 stop)
-    wpa_cli -i wlan0 terminate >/dev/null 2>&1
-    if [ -f /var/run/udhcpc-wlan0.pid ]; then
-        kill "$(cat /var/run/udhcpc-wlan0.pid)" 2>/dev/null
+    if running; then
+        kill "$(cat "$PIDFILE")" 2>/dev/null
+        for wifi_wait in 1 2 3 4 5; do running || break; sleep 1; done
+        running && { echo 'wifi: monitor did not stop'; exit 1; }
     fi
+    rm -f "$PIDFILE"
+    wpa_cli -i wlan0 terminate >/dev/null 2>&1
+    stop_dhcp
     ;;
+restart) "$0" stop && "$0" start ;;
+status) running && { echo 'wifi: monitor running'; exit 0; }; echo 'wifi: monitor not running'; exit 1 ;;
 *) exit 1 ;;
 esac

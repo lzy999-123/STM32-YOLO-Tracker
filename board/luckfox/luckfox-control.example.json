@@ -2,5 +2,6 @@
   "uart": "/dev/ttyS2",
   "baud": 115200,
   "bind_address": "0.0.0.0",
+  "embedded_discovery": true,
   "auth_key": ""
 }

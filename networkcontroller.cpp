@@ -2,6 +2,7 @@
 #include <QCoreApplication>
 #include <QCryptographicHash>
 #include <QDir>
+#include <QDebug>
 #include <QFile>
 #include <QJsonDocument>
 #include <QMessageAuthenticationCode>
@@ -9,6 +10,10 @@
 #include <QUuid>
 #include <cctype>
 #include <cmath>
+#ifdef Q_OS_WIN
+#include <winsock2.h>
+#include <qos2.h>
+#endif
 
 namespace {
 QByteArray authCode(const QByteArray &inner, const QByteArray &key)
@@ -89,6 +94,48 @@ NetworkController::NetworkController(QObject *parent) : QObject(parent)
     m_authKey = loadAuthKey(&m_authError);
 }
 
+NetworkController::~NetworkController()
+{
+    releaseTrafficPriority();
+}
+
+void NetworkController::configureTrafficPriority()
+{
+#ifdef Q_OS_WIN
+    // Qt 的 IP_TOS 选项不支持 Windows；用系统 qWave 标记这一个低带宽控制流。
+    QOS_VERSION version{1, 0};
+    HANDLE handle = nullptr;
+    if (!QOSCreateHandle(&version, &handle)) {
+        qDebug() << "[Control] qWave unavailable, error=" << GetLastError();
+        return;
+    }
+    sockaddr_in destination{};
+    destination.sin_family = AF_INET;
+    destination.sin_addr.s_addr = htonl(m_address.toIPv4Address());
+    destination.sin_port = htons(m_port);
+    QOS_FLOWID flow = 0;
+    if (!QOSAddSocketToFlow(handle, static_cast<SOCKET>(m_socket.socketDescriptor()),
+            reinterpret_cast<PSOCKADDR>(&destination), QOSTrafficTypeControl,
+            QOS_NON_ADAPTIVE_FLOW, &flow)) {
+        qDebug() << "[Control] qWave flow unavailable, error=" << GetLastError();
+        QOSCloseHandle(handle);
+        return;
+    }
+    m_qosHandle = handle;
+    qInfo() << "[Control] traffic_priority=control dscp=56 flow=" << flow;
+#else
+    m_socket.setSocketOption(QAbstractSocket::TypeOfServiceOption, 0xe0);
+#endif
+}
+
+void NetworkController::releaseTrafficPriority()
+{
+#ifdef Q_OS_WIN
+    if (m_qosHandle) QOSCloseHandle(static_cast<HANDLE>(m_qosHandle));
+#endif
+    m_qosHandle = nullptr;
+}
+
 void NetworkController::connectToDevice(const QString &address, quint16 port)
 {
     const QHostAddress host(address);
@@ -108,6 +155,7 @@ void NetworkController::connectToDevice(const QString &address, quint16 port)
         emit connectionLost(QStringLiteral("无法打开网络控制通道：%1").arg(m_socket.errorString()));
         return;
     }
+    configureTrafficPriority();
     m_session = QUuid::createUuid().toString(QUuid::WithoutBraces);
     m_sequence = 0;
     m_lastTelemetrySequence = 0;
@@ -137,6 +185,7 @@ void NetworkController::disconnectDevice()
     m_remoteOnline = false;
     m_timer.stop();
     m_commands.clear();
+    releaseTrafficPriority();
     m_socket.close();
     setOnline(false);
     setFlags(0);
@@ -195,8 +244,23 @@ void NetworkController::transmitCommand()
 {
     if (m_commands.isEmpty()) return;
     const auto &command = m_commands.head();
-    send({{"type", "command"}, {"request", double(command.request)}, {"cmd", command.cmd}});
+    QJsonObject message{{"type", command.stepTenths ? "manual_step" : "command"},
+                        {"request", double(command.request)}, {"cmd", command.cmd}};
+    if (command.stepTenths) message.insert("step_tenths", command.stepTenths);
+    send(message);
     m_lastCommand = m_clock.elapsed();
+}
+
+void NetworkController::sendManualStep(uint8_t cmd, quint16 stepTenths)
+{
+    if (cmd < CmdManualUp || cmd > CmdManualRight || stepTenths < 1 || stepTenths > 100 ||
+        !isOpen() || m_commands.size() >= 16) {
+        emit commandFailed(cmd);
+        return;
+    }
+    // Freeze the selected step in the request so retries and queued clicks use it unchanged.
+    m_commands.enqueue({++m_sequence, cmd, 0, stepTenths});
+    if (m_commands.size() == 1) transmitCommand();
 }
 
 void NetworkController::tick()
@@ -266,6 +330,21 @@ void NetworkController::receive()
                 m_remoteOnline = true;
                 setOnline(true);
                 setFlags(flags >= 0 && flags <= 255 ? flags : 0);
+                const auto calibration = reply.value("calibration").toObject();
+                const double h = calibration.value("horizontal").toDouble(NAN);
+                const double v = calibration.value("vertical").toDouble(NAN);
+                const double hMin = calibration.value("horizontal_min").toDouble(NAN);
+                const double hMax = calibration.value("horizontal_max").toDouble(NAN);
+                const double vMin = calibration.value("vertical_min").toDouble(NAN);
+                const double vMax = calibration.value("vertical_max").toDouble(NAN);
+                const bool valid = calibration.value("valid").toBool(false) &&
+                    std::isfinite(h) && std::isfinite(v) && std::isfinite(hMin) &&
+                    std::isfinite(hMax) && std::isfinite(vMin) && std::isfinite(vMax) &&
+                    -3276.8 <= hMin && hMin <= h && h <= hMax && hMax <= 3276.7 &&
+                    -3276.8 <= vMin && vMin <= v && v <= vMax && vMax <= 3276.7;
+                emit calibrationReceived(valid, valid ? float(h) : 0.0f, valid ? float(v) : 0.0f,
+                                         valid ? float(hMin) : 0.0f, valid ? float(hMax) : 0.0f,
+                                         valid ? float(vMin) : 0.0f, valid ? float(vMax) : 0.0f);
                 emit telemetryReceived(mode, float(horizontal), float(vertical));
             } else {
                 m_remoteOnline = false;

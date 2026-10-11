@@ -15,15 +15,25 @@
 #include <QStatusBar>
 #include <QLabel>
 #include <QMenu>
+#include <QActionGroup>
 #include <QResizeEvent>
 #include <QTimer>
 
 #include <algorithm>
+#include <cmath>
 #include <utility>
 
 namespace {
 constexpr int kRealtimeWidth = 1280;
 constexpr int kRealtimeHeight = 720;
+
+QString signedAngleText(float angle)
+{
+    if (!std::isfinite(angle)) return QStringLiteral("--");
+    if (std::abs(angle) < 0.05f) angle = 0.0f;
+    return QStringLiteral("%1%2°").arg(angle >= 0.0f ? QStringLiteral("+") : QString())
+        .arg(angle, 0, 'f', 1);
+}
 
 QString selectedCameraSource(const QComboBox *comboBox)
 {
@@ -69,6 +79,8 @@ MainWindow::MainWindow(QWidget *parent, bool autoConnect)
     , m_lostFrameCount(0)
 {
     ui->setupUi(this);
+    // This camera installation uses vertical flip as the normal viewing direction.
+    m_cameraManager.setRotationMode(CameraManager::RotationMode::MirrorV);
     cv::setNumThreads(4);
     setWindowTitle(QStringLiteral("Luckfox 无线云台跟踪系统"));
 
@@ -93,19 +105,23 @@ MainWindow::MainWindow(QWidget *parent, bool autoConnect)
     ui->LED1->setStyleSheet(QStringLiteral("background-color:red"));
     ui->pushButton_2->setEnabled(false);
     ui->pushButton_3->setEnabled(false);
-    // 手动步进固定为每次 0.5°，避免 UI 数值与下位机步进协议不一致。
-    ui->doubleSpinBox->setDecimals(2);
-    ui->doubleSpinBox->setRange(0.5, 0.5);
-    ui->doubleSpinBox->setSingleStep(0.5);
+    ui->doubleSpinBox->setDecimals(1);
+    ui->doubleSpinBox->setRange(0.1, 10.0);
+    ui->doubleSpinBox->setSingleStep(0.1);
     ui->doubleSpinBox->setValue(0.5);
-    ui->doubleSpinBox->setReadOnly(true);
+    ui->doubleSpinBox->setReadOnly(false);
+    ui->doubleSpinBox->setSuffix(QStringLiteral("°"));
+    ui->doubleSpinBox->setToolTip(QStringLiteral("每次点击方向按钮的转动角度：0.1°～10°"));
     for (QPushButton *button : {ui->pushButton_4, ui->pushButton_5,
                                 ui->pushButton_6, ui->pushButton_7}) {
         button->setEnabled(false);
-        button->setToolTip(QStringLiteral("仅手动模式可用，每次转动 0.5°"));
+        button->setToolTip(QStringLiteral("仅手动模式可用，按上方设定的步长转动"));
     }
     ui->label_11->setText(QStringLiteral("离线"));
     ui->label_11->setStyleSheet(QStringLiteral("color: black; font-size: 14px; font-weight: bold;"));
+    ui->label_16->setText(QStringLiteral("--"));
+    ui->label_17->setText(QStringLiteral("--"));
+    ui->label_13->setToolTip(QStringLiteral("下位机当前生效的校准参考角度；回中返回该姿态，实时角度见状态栏"));
 
     setupNetworkUi();
     testDNN();
@@ -168,18 +184,30 @@ MainWindow::MainWindow(QWidget *parent, bool autoConnect)
         m_modeSwitchPending = false;
         ui->plainTextEdit_2->appendPlainText(QStringLiteral("【无线控制】命令 0x%1 未得到 STM32 确认")
             .arg(cmd, 2, 16, QLatin1Char('0')));
+        if (cmd >= NetworkController::CmdManualUp && cmd <= NetworkController::CmdManualRight)
+            ui->plainTextEdit_2->appendPlainText(QStringLiteral("【手动控制】可调步长需要配套的 Luckfox 控制脚本和 STM32 固件"));
         stopLocalControl();
         updateGimbalStatus();
+    });
+    connect(&m_networkController, &NetworkController::calibrationReceived, this,
+            [this](bool valid, float horizontal, float vertical, float hMin, float hMax, float vMin, float vMax) {
+        ui->label_16->setText(valid ? signedAngleText(horizontal) : QStringLiteral("--"));
+        ui->label_17->setText(valid ? signedAngleText(vertical) : QStringLiteral("--"));
+        const QString unavailable = QStringLiteral("尚未收到有效校准信息，请确认下位机固件已更新且校准有效");
+        ui->label_16->setToolTip(valid ? QStringLiteral("校准参考角度；水平目标范围：%1 ～ %2")
+            .arg(signedAngleText(hMin), signedAngleText(hMax)) : unavailable);
+        ui->label_17->setToolTip(valid ? QStringLiteral("校准参考角度；垂直目标范围：%1 ～ %2")
+            .arg(signedAngleText(vMin), signedAngleText(vMax)) : unavailable);
     });
     connect(&m_networkController, &NetworkController::telemetryReceived, this,
             [this](int mode, float horizontal, float vertical) {
         const int flags = m_networkController.telemetryFlags();
         QString alarm;
-        if (flags & NetworkController::FlagFault) alarm += QStringLiteral(" · 编码器故障");
+        if (flags & NetworkController::FlagFault) alarm += QStringLiteral(" · 下位机故障");
         if (flags & NetworkController::FlagEmergencyStop) alarm += QStringLiteral(" · 急停");
         if (flags & NetworkController::FlagLinkLost) alarm += QStringLiteral(" · 链路丢失");
-        m_gimbalStatus->setText(QStringLiteral("云台在线 · 水平 %1° / 垂直 %2°%3")
-            .arg(horizontal, 0, 'f', 1).arg(vertical, 0, 'f', 1).arg(alarm));
+        m_gimbalStatus->setText(QStringLiteral("云台在线 · 水平 %1 / 垂直 %2%3")
+            .arg(signedAngleText(horizontal), signedAngleText(vertical), alarm));
         if (mode != m_lastRemoteMode) {
             m_modeSwitchPending = false;
             m_lastRemoteMode = mode;
@@ -194,7 +222,7 @@ MainWindow::MainWindow(QWidget *parent, bool autoConnect)
         qInfo() << "[Device] telemetry_flags=" << flags;
         if (flags & (NetworkController::FlagFault | NetworkController::FlagEmergencyStop)) {
             ui->plainTextEdit_2->appendPlainText(QStringLiteral("【云台】%1，已停止本地跟踪")
-                .arg(flags & NetworkController::FlagFault ? QStringLiteral("下位机报告编码器/系统故障")
+                .arg(flags & NetworkController::FlagFault ? QStringLiteral("下位机报告系统故障")
                                                           : QStringLiteral("下位机处于急停状态")));
             stopLocalControl();
         } else if (flags & NetworkController::FlagLinkLost) {
@@ -307,6 +335,22 @@ MainWindow::MainWindow(QWidget *parent, bool autoConnect)
         if (state == CameraManager::CameraState::Idle || state == CameraManager::CameraState::Closing || state == CameraManager::CameraState::Error) {
             stopLocalControl();
             if (m_networkController.isOpen()) m_networkController.sendCommand(NetworkController::CmdTrackOff);
+            if (state == CameraManager::CameraState::Error) {
+                // 重连握手可能先于首帧完成；禁止框选上一会话遗留的画面。
+                QMutexLocker locker(&m_pendingFrameMutex);
+                m_pendingMat.release();
+                m_hasPendingMat = false;
+                m_pendingVideoFrame = QVideoFrame();
+                m_lastFrame.release();
+                m_displayedFps = 0;
+                m_fpsFrameCount = 0;
+                m_lastFpsCalcTime = 0;
+                m_lastDisplayFrameTime = 0;
+                m_renderCanvas = QPixmap();
+                ui->imageLabel->clear();
+                ui->imageLabel->setText(QStringLiteral("视频中断\n请检查连接状态"));
+                ui->statusbar->showMessage(QStringLiteral("新画面 0 帧/秒 · 视频中断"));
+            }
         }
         if (state == CameraManager::CameraState::Idle) {
             ui->pushButton_9->setText(QStringLiteral("打开摄像头"));
@@ -444,16 +488,14 @@ void MainWindow::stopTrackingSafely()
 
 QPoint MainWindow::controlOffsets() const
 {
-    // 偏移是在经过方向变换后的画面上计算的。约定：
-    // - 旋转 180°/90°/270° 视为“安装方向校正”：校正后的画面与云台真实方向一致，
-    //   偏移保持在校正后的画面坐标系中，不再取反（下位机按正装相机标定方向）。
-    // - 水平镜像 / 垂直翻转只是显示偏好，真实场景并未镜像：下发前把对应轴取反，
-    //   保证云台仍朝真实目标方向转动。
+    // 跟踪使用已经校正安装方向的画面：向右 X>0，向下 Y>0。
+    // 当前摄像头的垂直翻转是安装校正；与旋转模式一样，不再反转控制偏移。
+    // 下位机 AutoVelocity 对正偏移减小逻辑角度，与手动向右/向下方向一致。
+    // 水平镜像仍作为显示偏好，保留原来的 X 补偿。
     int x = m_offsetX;
     int y = m_offsetY;
     const CameraManager::RotationMode mode = m_cameraManager.rotationMode();
     if (mode == CameraManager::RotationMode::MirrorH) x = -x;
-    if (mode == CameraManager::RotationMode::MirrorV) y = -y;
     return QPoint(x, y);
 }
 
@@ -591,10 +633,15 @@ void MainWindow::setupNetworkUi()
     ui->statusbar->addWidget(m_gimbalStatus, 1);
     auto *orientation = new QPushButton(QStringLiteral("画面方向"), this);
     auto *menu = new QMenu(orientation);
+    auto *directionGroup = new QActionGroup(menu);
+    directionGroup->setExclusive(true);
     const QStringList names{QStringLiteral("正常"), QStringLiteral("旋转 180°"),
         QStringLiteral("水平镜像"), QStringLiteral("垂直翻转"), QStringLiteral("旋转 90°"), QStringLiteral("旋转 270°")};
     for (int mode = 0; mode < names.size(); ++mode) {
         auto *action = menu->addAction(names[mode]);
+        action->setCheckable(true);
+        action->setChecked(mode == static_cast<int>(m_cameraManager.rotationMode()));
+        directionGroup->addAction(action);
         connect(action, &QAction::triggered, this, [this, mode] {
             stopLocalControl();
             if (m_networkController.isOpen()) m_networkController.sendCommand(NetworkController::CmdTrackOff);
@@ -639,6 +686,10 @@ void MainWindow::stopLocalControl()
 void MainWindow::updateGimbalStatus()
 {
     if (!m_networkController.isOpen()) {
+        ui->label_16->setText(QStringLiteral("--"));
+        ui->label_17->setText(QStringLiteral("--"));
+        ui->label_16->setToolTip(QStringLiteral("下位机离线，校准信息不可用"));
+        ui->label_17->setToolTip(QStringLiteral("下位机离线，校准信息不可用"));
         ui->label_11->setText(QStringLiteral("离线"));
         m_gimbalStatus->setText(m_networkController.isConnected()
             ? QStringLiteral("Luckfox 控制已连接 · STM32 离线")
@@ -941,7 +992,7 @@ void MainWindow::processLatestVideoFrame()
 
     if (m_cameraManager.state() != CameraManager::CameraState::Open || cvMat.empty()) return;
 
-    // RTSP 已在后台合并为最新帧；无线到包有抖动，不能再按 20ms 间隔丢帧。
+    // RTSP 已在后台合并为最新帧，不能再按到包间隔丢弃显示帧。
     // 本地摄像头保留上限，避免高帧率设备占满 GUI。
     const qint64 frameNow = QDateTime::currentMSecsSinceEpoch();
     if (!m_cameraManager.currentCameraId().startsWith(QStringLiteral("rtsp://"), Qt::CaseInsensitive) &&
@@ -1073,6 +1124,19 @@ void MainWindow::processLatestVideoFrame()
             painter.drawText(32, 72, QStringLiteral("FPS: %1").arg(m_displayedFps));
             painter.setPen(Qt::yellow);
             painter.drawText(30, 70, QStringLiteral("FPS: %1").arg(m_displayedFps));
+
+            // Render the PC clock after orientation correction. Keep it out of
+            // cvMat so the displayed text never enters target tracking.
+            const QString timestamp = QDateTime::currentDateTime().toString(QStringLiteral("yyyy-MM-dd HH:mm:ss"));
+            const QRect timestampRect = QRect(xOffset, yOffset, scaledImageSize.width(), scaledImageSize.height())
+                .adjusted(12, 12, -12, -12);
+            painter.save();
+            painter.setClipRect(QRect(xOffset, yOffset, scaledImageSize.width(), scaledImageSize.height()));
+            painter.setPen(Qt::black);
+            painter.drawText(timestampRect.translated(1, 1), Qt::AlignLeft | Qt::AlignTop, timestamp);
+            painter.setPen(Qt::yellow);
+            painter.drawText(timestampRect, Qt::AlignLeft | Qt::AlignTop, timestamp);
+            painter.restore();
 
             painter.end();
             ui->imageLabel->setPixmap(m_renderCanvas);
@@ -1500,16 +1564,17 @@ void MainWindow::sendManualStep(uint8_t cmd, const QString &direction)
         QMessageBox::warning(this, QStringLiteral("提示"), QStringLiteral("请先连接 Luckfox 并等待 STM32 云台上线！"));
         return;
     }
-    if (!manual || ui->label_11->text() != QStringLiteral("手动")) {
+    if (m_modeSwitchPending || !manual || ui->label_11->text() != QStringLiteral("手动")) {
         ui->plainTextEdit_2->appendPlainText(QStringLiteral("【手动控制】当前不是手动模式，忽略%1操作").arg(direction));
         updateManualControlAvailability();
         return;
     }
 
-    // 下位机收到一个命令只改变一次目标角度，固定为 0.5°。
-    sendCommand(cmd);
+    ui->doubleSpinBox->interpretText();
+    const quint16 stepTenths = quint16(qRound(ui->doubleSpinBox->value() * 10.0));
+    m_networkController.sendManualStep(cmd, stepTenths);
     ui->plainTextEdit_2->appendPlainText(
-        QStringLiteral("【手动控制】%1 0.5°").arg(direction));
+        QStringLiteral("【手动控制】请求%1 %2°").arg(direction).arg(stepTenths / 10.0, 0, 'f', 1));
 }
 
 void MainWindow::on_pushButton_4_clicked()

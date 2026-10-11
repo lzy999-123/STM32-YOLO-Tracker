@@ -26,7 +26,7 @@ HEADERS += \
 FORMS += \
     mainwindow.ui
 
-win32:LIBS += -lwlanapi
+win32:LIBS += -lwlanapi -lqwave -lws2_32
 
 # Default rules for deployment.
 qnx: target.path = /tmp/$${TARGET}/bin

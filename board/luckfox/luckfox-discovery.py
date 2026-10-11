@@ -9,6 +9,7 @@ import time
 
 PORT = 39093
 DEFAULT_CONFIG = '/userdata/cfg/luckfox-control.json'
+INTEGRATED_PIDFILE = '/var/run/luckfox-discovery.integrated.pid'
 _last_log = {}
 
 
@@ -94,6 +95,56 @@ def answer(packet, ident, key):
     response = {'type': 'luckfox-camera', 'version': 1, 'nonce': nonce,
                 'device_id': ident, 'rtsp_port': 554, 'path': '/live/0'}
     return seal(json.dumps(response, separators=(',', ':')), key)
+
+
+class Responder:
+    """供控制主循环复用的非阻塞发现端口，不创建第二个 Python 进程。"""
+    def __init__(self, config, key, pidfile=None, port=PORT):
+        self.ident = device_id(config)
+        self.key, self.pidfile = key, pidfile
+        self.pid = str(os.getpid())
+        self.marker_written = False
+        self.server = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
+        try:
+            self.server.bind((config.get('bind_address', '0.0.0.0'), port))
+            self.server.setblocking(False)
+            if pidfile is not None:
+                with open(pidfile, 'w', encoding='ascii') as target:
+                    target.write(self.pid + '\n')
+                self.marker_written = True
+        except Exception:
+            self.close()
+            raise
+
+    def poll(self):
+        # 每轮最多一包，留出 UART、控制心跳与遥测的处理机会。
+        try:
+            packet, peer = self.server.recvfrom(513)
+        except BlockingIOError:
+            return
+        except OSError as error:
+            log('内嵌发现接收失败：%s' % error, key='embedded-recv')
+            return
+        if len(packet) > 512:
+            return
+        response = answer(packet, self.ident, self.key)
+        if response is not None:
+            try:
+                self.server.sendto(response, peer)
+            except OSError as error:
+                log('内嵌发现发送失败：%s' % error, key='embedded-send')
+
+    def close(self):
+        self.server.close()
+        if self.marker_written:
+            try:
+                with open(self.pidfile, encoding='ascii') as source:
+                    owner = source.read().strip()
+                if owner == self.pid:
+                    os.unlink(self.pidfile)
+            except OSError:
+                pass
+            self.marker_written = False
 
 
 def serve(config, key):

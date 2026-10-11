@@ -138,10 +138,10 @@ private:
     /// @brief 若有尚未下发的新跟踪结果，且满足 20ms 最小间隔，则下发一次偏移
     void flushTrackData();
 
-    /// @brief 把图像坐标系下的偏移换算为云台控制方向（处理仅用于显示的镜像/翻转）
+    /// @brief 保留安装校正后的跟踪偏移，并补偿仅用于显示的水平镜像。
     QPoint controlOffsets() const;
 
-    /// @brief 执行一次固定 0.5° 的手动步进
+    /// @brief 按输入框当前步长请求一次手动步进（0.1°～10°）
     void sendManualStep(uint8_t cmd, const QString &direction);
     
     /// @brief 获取 UI 上当前选中的模型文件名

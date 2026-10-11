@@ -2,6 +2,7 @@
 # PIDFILE 记录守护外壳（本脚本 supervise）；外壳在 Python 退出后 2s 重启它，配置错误（退出码 2）除外。
 PIDFILE=/var/run/luckfox-discovery.pid
 CHILD_PIDFILE=/var/run/luckfox-discovery.child.pid
+INTEGRATED_PIDFILE=/var/run/luckfox-discovery.integrated.pid
 SCRIPT=/oem/usr/bin/luckfox-discovery.py
 CONFIG=/userdata/cfg/luckfox-control.json
 LOG=/tmp/luckfox-discovery.log
@@ -18,6 +19,17 @@ pid_matches() {
 }
 running() { pid_matches "$PIDFILE" "$SELF" supervise; }
 child_running() { pid_matches "$CHILD_PIDFILE" "$SCRIPT"; }
+integrated_running() { pid_matches "$INTEGRATED_PIDFILE" /oem/usr/bin/luckfox-control.py; }
+wait_integrated() {
+  integrated_running && return 0
+  # 控制脚本先返回，Python 仍可能在导入并绑定端口；开机时不能抢先另起解释器。
+  pid_matches /var/run/luckfox-control.child.pid /oem/usr/bin/luckfox-control.py || return 1
+  for discovery_ready in 1 2 3 4 5; do
+    sleep 1
+    integrated_running && return 0
+  done
+  return 1
+}
 stop_child() {
   child_running || return 0
   kill "$(cat "$CHILD_PIDFILE")" 2>/dev/null
@@ -30,6 +42,12 @@ case "$1" in
     child=
     trap '[ -n "$child" ] && kill "$child" 2>/dev/null && wait "$child"; rm -f "$CHILD_PIDFILE"; exit 0' TERM INT
     while :; do
+      if wait_integrated; then
+        # 保留轻量守护外壳作备用；共用端口正常时不驻留第二个 Python。
+        sleep 2 &
+        wait $!
+        continue
+      fi
       /usr/bin/python3 -S "$SCRIPT" --config "$CONFIG" </dev/null &
       child=$!
       echo "$child" > "$CHILD_PIDFILE"
@@ -44,6 +62,12 @@ case "$1" in
     done
     ;;
   start)
+    if wait_integrated; then
+      # 若旧的独立守护外壳仍在，先退出它，避免后来另起一个解释器。
+      "$0" stop || exit 1
+      echo "discovery: 与控制进程共用 UDP 39093"
+      exit 0
+    fi
     running && exit 0
     stop_child || { echo "discovery: 无法结束遗留进程"; exit 1; }
     rm -f "$PIDFILE" "$CHILD_PIDFILE"
@@ -61,6 +85,10 @@ case "$1" in
     rm -f "$PIDFILE" "$CHILD_PIDFILE"
     ;;
   restart) "$0" stop && "$0" start ;;
-  status) running && { echo "discovery: 正在运行"; exit 0; }; echo "discovery: 未运行"; exit 1 ;;
+  status)
+    integrated_running && { echo "discovery: 与控制进程共用 UDP 39093"; exit 0; }
+    running && { echo "discovery: 正在运行"; exit 0; }
+    echo "discovery: 未运行"; exit 1
+    ;;
   *) echo "usage: $0 {start|stop|restart|status}"; exit 1 ;;
 esac

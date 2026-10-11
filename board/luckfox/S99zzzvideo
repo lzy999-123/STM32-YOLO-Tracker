@@ -1,0 +1,178 @@
+#!/bin/sh
+# One rkipc owner, including the vendor launcher and late init entrypoint.
+SELF=$(readlink -f "$0" 2>/dev/null) || SELF=$0
+BINARY=/oem/usr/bin/rkipc
+CONFIG=/userdata/rkipc.ini
+IQ=/oem/usr/share/iqfiles
+PIDFILE=/var/run/luckfox-video.pid
+CHILD_PIDFILE=/var/run/luckfox-video.child.pid
+LOG=/tmp/rkipc-video-service.log
+SERVICE_LOG=/tmp/luckfox-video-service.log
+
+running() {
+    [ -f "$PIDFILE" ] || return 1
+    supervisor_pid=$(cat "$PIDFILE")
+    case "$supervisor_pid" in ''|*[!0-9]*) return 1 ;; esac
+    [ -r "/proc/$supervisor_pid/cmdline" ] || return 1
+    tr '\000' '\n' < "/proc/$supervisor_pid/cmdline" | grep -Fxq -- "$SELF" || return 1
+    tr '\000' '\n' < "/proc/$supervisor_pid/cmdline" | grep -Fxq -- supervise
+}
+video_identity() {
+    case "$1" in ''|*[!0-9]*) return 1 ;; esac
+    [ "$(readlink "/proc/$1/exe" 2>/dev/null)" = "$BINARY" ] || return 1
+    awk -v pid="$1" '{print pid, $22}' "/proc/$1/stat" 2>/dev/null
+}
+child_running() {
+    [ -f "$CHILD_PIDFILE" ] || return 1
+    read video_pid video_started < "$CHILD_PIDFILE"
+    [ -n "$video_started" ] || return 1
+    [ "$(video_identity "$video_pid")" = "$video_pid $video_started" ]
+}
+stop_child() {
+    child_running || return 0
+    kill "$video_pid" 2>/dev/null || return 1
+    for video_wait in 1 2 3 4 5 6 7 8; do
+        child_running || return 0
+        sleep 1 9>&-
+    done
+    child_running && return 1
+    return 0
+}
+# Truncate the existing inode: the encoder opens it with O_APPEND.
+# Keep only a small tail; do not use a Python/logger process on this board.
+trim_log() {
+    [ -f "$1" ] || return 0
+    [ "$(wc -c < "$1")" -gt "$2" ] || return 0
+    tail -c "$3" "$1" > "$1.tail" && cat "$1.tail" > "$1"
+    rm -f "$1.tail"
+}
+pause() {
+    sleep "$1" 9>&- &
+    sleeper=$!
+    wait "$sleeper"
+    sleeper=
+}
+shutdown() {
+    trap '' TERM INT
+    [ -z "$sleeper" ] || kill "$sleeper" 2>/dev/null
+    if [ -n "$owned_child" ] && ! child_running; then
+        # A stop can arrive during the brief fork/exec startup window.
+        for video_wait in 1 2 3; do
+            identity=$(video_identity "$owned_child") && {
+                printf '%s\n' "$identity" > "$CHILD_PIDFILE"
+                break
+            }
+            sleep 1 9>&-
+        done
+    fi
+    if ! stop_child; then
+        echo "video: encoder stop timed out; preserving child identity"
+        rm -f "$PIDFILE"
+        exit 1
+    fi
+    [ -z "$owned_child" ] || wait "$owned_child" 2>/dev/null
+    rm -f "$PIDFILE" "$CHILD_PIDFILE"
+    exit 0
+}
+case "$1" in
+supervise)
+    exec 9>/var/run/luckfox-video.supervisor.lock
+    flock -n 9 || exit 0
+    printf '%s\n' "$$" > "$PIDFILE"
+    owned_child= sleeper= backoff=2
+    trap shutdown TERM INT
+    while :; do
+        trim_log "$SERVICE_LOG" 32768 8192
+        # Adopt a surviving vendor/maintenance instance instead of duplicating it.
+        count=0
+        for candidate in $(pidof rkipc); do
+            candidate_identity=$(video_identity "$candidate") || continue
+            identity=$candidate_identity
+            count=$((count + 1))
+        done
+        if [ "$count" -gt 1 ]; then
+            echo "video: multiple encoders exist; refusing another start"
+            rm -f "$PIDFILE"
+            exit 1
+        fi
+        if [ "$count" -eq 1 ]; then
+            printf '%s\n' "$identity" > "$CHILD_PIDFILE"
+            echo "video: adopted encoder $identity"
+        elif [ -x "$BINARY" ] && [ -f "$CONFIG" ] && [ -d "$IQ" ] && [ -e /dev/video0 ]; then
+            cd /oem/usr/bin || exit 1
+            export LD_LIBRARY_PATH=/oem/usr/lib:/usr/lib:${LD_LIBRARY_PATH:-}
+            trim_log "$LOG" 131072 32768
+            "$BINARY" -a "$IQ" -c "$CONFIG" >>"$LOG" 2>&1 </dev/null 9>&- &
+            owned_child=$!
+            identity=
+            # The background shell may not have exec'd the binary yet.
+            for video_wait in 1 2 3; do
+                identity=$(video_identity "$owned_child") && break
+                pause 1
+            done
+            if [ -n "$identity" ]; then
+                printf '%s\n' "$identity" > "$CHILD_PIDFILE"
+                echo "video: started encoder $identity"
+            fi
+        else
+            echo "video: waiting for encoder, config, IQ and camera device"
+            pause 2
+            continue
+        fi
+        alive_ticks=0
+        while child_running; do
+            pause 1
+            alive_ticks=$((alive_ticks + 1))
+            if [ $((alive_ticks % 10)) -eq 0 ]; then
+                trim_log "$LOG" 131072 32768
+                trim_log "$SERVICE_LOG" 32768 8192
+            fi
+        done
+        if [ -n "$owned_child" ]; then
+            wait "$owned_child"
+            echo "video: encoder exited, status=$?"
+            owned_child=
+        else
+            echo "video: adopted encoder exited"
+        fi
+        rm -f "$CHILD_PIDFILE"
+        [ "$alive_ticks" -lt 15 ] || backoff=2
+        echo "video: restart in ${backoff}s"
+        pause "$backoff"
+        backoff=$((backoff * 2))
+        [ "$backoff" -le 30 ] || backoff=30
+    done
+    ;;
+start|stop)
+    # Serialize lifecycle commands; children must not retain this lock.
+    exec 8>/var/run/luckfox-video.lifecycle.lock
+    flock -x 8 || exit 1
+    if [ "$1" = start ]; then
+        running && exit 0
+        nohup /bin/sh "$SELF" supervise >>"$SERVICE_LOG" 2>&1 </dev/null 8>&- &
+        for video_wait in 1 2 3; do
+            running && { echo "video: supervisor running"; exit 0; }
+            sleep 1
+        done
+        echo "video: supervisor start failed; check $SERVICE_LOG"
+        exit 1
+    fi
+    if running; then
+        kill "$supervisor_pid" 2>/dev/null || exit 1
+        for video_wait in 1 2 3 4 5 6 7 8 9 10; do
+            running || break
+            sleep 1
+        done
+        running && { echo "video: supervisor stop timed out"; exit 1; }
+    fi
+    stop_child || { echo "video: encoder stop timed out"; exit 1; }
+    rm -f "$PIDFILE" "$CHILD_PIDFILE"
+    echo "video: stopped"
+    ;;
+restart) "$SELF" stop && "$SELF" start ;;
+status)
+    running && child_running && { echo "video: running (encoder $video_pid)"; exit 0; }
+    running && { echo "video: supervisor waiting/recovering"; exit 1; }
+    echo "video: stopped"; exit 1 ;;
+*) echo "usage: $0 {start|stop|restart|status}"; exit 1 ;;
+esac

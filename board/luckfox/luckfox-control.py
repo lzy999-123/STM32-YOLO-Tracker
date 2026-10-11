@@ -7,7 +7,9 @@ import select
 import signal
 import socket
 import struct
+import subprocess
 import sys
+import threading
 import time
 
 COMMANDS = {0x01, 0x02, 0x11, 0x12, 0x20, 0x21, 0x22, 0x23}
@@ -20,6 +22,11 @@ FORWARD_INTERVAL = .02
 TRACK_MAX_AGE = .2
 SEEN_SESSIONS = 256
 DEFAULT_CONFIG = '/userdata/cfg/luckfox-control.json'
+UART_MAX_LEN = 40
+WIFI_TYPE = 0x05
+WIFI_UNKNOWN, WIFI_DISCONNECTED, WIFI_CONNECTED = 0, 1, 2
+WIFI_REPORT_INTERVAL = 2.0
+WIFI_PROBE_TIMEOUT = .5
 _last_log = {}
 
 
@@ -100,7 +107,7 @@ class FrameParser:
         result = []
         while len(self.buffer) >= 5:
             length = self.buffer[2]
-            if self.buffer[:2] != b'\xa5\x5a' or not 1 <= length <= 32:
+            if self.buffer[:2] != b'\xa5\x5a' or not 1 <= length <= UART_MAX_LEN:
                 del self.buffer[0]
                 continue
             size = length + 4
@@ -120,6 +127,103 @@ def integer(value, low, high):
     return type(value) is int and low <= value <= high
 
 
+def decode_wpa_ssid(text):
+    """Decode wpa_cli's printf-escaped SSID without reading saved credentials."""
+    result = bytearray()
+    index = 0
+    escapes = {ord('n'): 10, ord('r'): 13, ord('t'): 9, ord('e'): 27,
+               ord('\\'): 92, ord('"'): 34}
+    while index < len(text):
+        if text[index] == 92 and index + 1 < len(text):
+            code = text[index + 1]
+            if code == ord('x') and index + 3 < len(text):
+                digits = text[index + 2:index + 4]
+                if all(byte in b'0123456789abcdefABCDEF' for byte in digits):
+                    result.append(int(digits, 16))
+                    index += 4
+                    continue
+            if code in escapes:
+                result.append(escapes[code])
+                index += 2
+                continue
+        result.append(text[index])
+        index += 1
+    return bytes(result)
+
+
+def read_wifi_status():
+    """Report actual wlan0 association, independently of a Qt connection."""
+    try:
+        answer = subprocess.run(['wpa_cli', '-i', 'wlan0', 'status'],
+                                stdout=subprocess.PIPE, stderr=subprocess.DEVNULL,
+                                timeout=WIFI_PROBE_TIMEOUT, check=False)
+    except (OSError, subprocess.TimeoutExpired):
+        return bytes((WIFI_UNKNOWN,))
+    if answer.returncode != 0:
+        return bytes((WIFI_UNKNOWN,))
+    fields = {}
+    for line in answer.stdout.splitlines():
+        if b'=' in line:
+            key, value = line.split(b'=', 1)
+            fields[key] = value
+    if b'wpa_state' not in fields:
+        return bytes((WIFI_UNKNOWN,))
+    if fields[b'wpa_state'] != b'COMPLETED':
+        return bytes((WIFI_DISCONNECTED,))
+    ssid = decode_wpa_ssid(fields.get(b'ssid', b''))
+    if not 1 <= len(ssid) <= 32:
+        return bytes((WIFI_UNKNOWN,))
+    return bytes((WIFI_CONNECTED,)) + ssid
+
+
+class WifiReporter:
+    """Probe off the control loop; only the loop writes UART, every two seconds.
+
+    Reports continue with no Qt peer. A stalled/erroring probe expires to
+    unknown; these metadata frames must never refresh STM32's control lease.
+    """
+    def __init__(self, write_uart, clock=time.monotonic, probe=read_wifi_status):
+        self.write_uart, self.clock, self.probe = write_uart, clock, probe
+        self.lock = threading.Lock()
+        self.stop_event = threading.Event()
+        self.thread = None
+        self.payload = bytes((WIFI_UNKNOWN,))
+        self.sample_time = -100.0
+        self.last_report = -100.0
+        self.last_logged_payload = None
+
+    def start(self):
+        self.thread = threading.Thread(target=self._run, name='wifi-status', daemon=True)
+        self.thread.start()
+
+    def _run(self):
+        while not self.stop_event.is_set():
+            payload = self.probe()
+            with self.lock:
+                self.payload, self.sample_time = payload, self.clock()
+            self.stop_event.wait(WIFI_REPORT_INTERVAL)
+
+    def tick(self, enabled=True):
+        if not enabled:
+            return
+        now = self.clock()
+        if now - self.last_report < WIFI_REPORT_INTERVAL:
+            return
+        with self.lock:
+            payload = self.payload if now - self.sample_time <= 5.0 else bytes((WIFI_UNKNOWN,))
+        self.write_uart(frame(WIFI_TYPE, payload))
+        self.last_report = now
+        if payload != self.last_logged_payload:
+            # Keep SSIDs and credentials out of logs; report state and byte count only.
+            log('OLED Wi-Fi report: state=%d, ssid_bytes=%d' % (payload[0], len(payload) - 1))
+            self.last_logged_payload = payload
+
+    def close(self):
+        self.stop_event.set()
+        if self.thread is not None:
+            self.thread.join(timeout=WIFI_PROBE_TIMEOUT + .2)
+
+
 class Bridge:
     """Protocol engine; the clock and UART writer can be injected for verification."""
     def __init__(self, write_uart, clock=time.monotonic, auth_key=None):
@@ -131,6 +235,7 @@ class Bridge:
         self.last_client = 0
         self.last_telemetry = -100
         self.last_calibration = -100
+        self.last_wifi_capability = -100
         self.calibration = None
         self.last_heartbeat = -100
         self.last_status = -100
@@ -250,6 +355,10 @@ class Bridge:
             self.mode, self.horizontal, self.vertical = mode, horizontal / 10.0, vertical / 10.0
             self.flags = payload[5] if len(payload) == 6 else 0
             self.last_telemetry = self.clock()
+        elif kind == 0x84 and payload == b'\x01':
+            if self.clock() - self.last_wifi_capability > 2.5:
+                log('STM32 OLED Wi-Fi capability version=1')
+            self.last_wifi_capability = self.clock()
         elif kind == 0x83 and len(payload) == 13:
             mask, horizontal, vertical, h_min, h_max, v_min, v_max = struct.unpack('>Bhhhhhh', payload)
             if mask > 3 or not h_min <= horizontal <= h_max or not v_min <= vertical <= v_max:
@@ -263,6 +372,10 @@ class Bridge:
             request, cmd, _ = self.pending
             if payload[0] == cmd:
                 self.finish_command(request, cmd, 'ack')
+
+    def wifi_ui_ready(self):
+        now = self.clock()
+        return now - self.last_wifi_capability <= 2.5 and now - self.last_telemetry <= 1.0
 
     def tick(self):
         if self.peer is None:
@@ -425,6 +538,7 @@ def open_embedded_discovery(config, auth_key):
 def serve(config, auth_key):
     uart = UartLink(config['uart'], config.get('baud', 115200))
     engine = Bridge(uart.write, auth_key=auth_key)
+    wifi = WifiReporter(uart.write)
     server = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
     discovery = None
     try:
@@ -443,6 +557,7 @@ def serve(config, auth_key):
             except (OSError, ValueError, ImportError) as error:
                 # 发现端口异常不能中断已经工作的 UART/控制服务。
                 log('内嵌发现启动失败：%s；可使用独立发现服务' % error)
+        wifi.start()
         while True:
             uart.ensure_open()
             uart_fd = uart.fd()
@@ -463,6 +578,9 @@ def serve(config, auth_key):
             if discovery is not None and discovery.server in ready:
                 discovery.poll()
             engine.tick()
+            # Old firmware counts unknown frame types as control activity.
+            # Wait for an explicit new-firmware capability before metadata TX.
+            wifi.tick(enabled=engine.wifi_ui_ready())
             for data, peer in engine.drain():
                 try:
                     server.sendto(data, peer)
@@ -472,6 +590,7 @@ def serve(config, auth_key):
         try:
             engine.release()
         finally:
+            wifi.close()
             uart.close()
             server.close()
             if discovery is not None:

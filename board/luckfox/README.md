@@ -122,7 +122,7 @@ sh /tmp/install_video_service.sh /tmp/S99zzzvideo.upload
 历史上曾猜测PREEMPT_COUNT不一致是根因，但启用后仍出现故障；不能把此项写成已经证明的故障原因。
 实际已运行的主驱动没有在crypto.h对齐修正后再次重编，修正后的CCMP依赖与该主驱动组合已通过无线视频及重启验证。
 
-完整证据摘要见根目录 `WIFI_DRIVER_HANDOFF.md` 和 `MILESTONE_2026-10-08.md`。
+早期证据摘要见 [驱动交接记录](../../docs/archive/WIFI_DRIVER_HANDOFF.md) 和 [2026-10-08 阶段记录](../../docs/archive/MILESTONE_2026-10-08.md)。
 
 ## 无线云台转发
 
@@ -136,6 +136,7 @@ sh /tmp/install_video_service.sh /tmp/S99zzzvideo.upload
 部署与当前 UART 启用限制见根目录 [无线控制说明](../../WIRELESS_CONTROL.md)。
 `/userdata/cfg/luckfox-control.json` 必须使用确认后的实际 UART；配置缺失时不启动服务。
 网络命令按请求编号去重，UART 非幂等命令不盲目重发；UART ACK 超时只报告失败、保留会话。
+新版脚本还读取实际 `wlan0` 关联状态，在新 STM32 固件能力确认后每 2 秒发送 Wi-Fi 名称；不依赖 Qt 会话，不刷新控制心跳。PC13 短按切页、长按切模式和长名称滚动的配套固件、协议与验收说明见 [STM32 OLED Wi-Fi 页面](../stm32/README.md)。2026-10-11 已完成实板脚本部署及 UART 能力 / 名称上报检查，用户确认短按 PC13 后名称正确；长名称及长按的现场验收尚未执行。
 断网或 bye 时只发送停止跟踪（0x12）并停止 UART 心跳，不主动回中，由 STM32 链路超时在自动模式回中。
 两个服务由启动脚本的 `supervise` 外壳守护，异常退出后自动重启；UART 读写错误会关闭并退避重开。
 `auth_key` 配置后控制和发现消息使用 HMAC-SHA256 签名，样例配置中为空（不认证）；配置与密钥分发见

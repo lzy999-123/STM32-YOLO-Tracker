@@ -28,7 +28,7 @@
 
 ## 部署说明
 
-最新阶段进展和验证范围见 [2026-10-08 阶段记录](MILESTONE_2026-10-08.md)。
+当前阶段进展和验证范围见 [2026-10-11 阶段提交报告](docs/learning/2026-10-11-08-github-checkpoint.md)，当前视频链路见 [720p 视频部署与验收](docs/deploy/VIDEO_720P30.md)。较早的交接、驱动和阶段记录已归入 [历史文档](docs/archive/README.md)。
 
 ### Luckfox 无线摄像头
 
@@ -43,3 +43,17 @@
 1.  环境准备：需安装 Qt Widgets、Network、Concurrent、Multimedia，并在 `.pro` 中配置 OpenCV 和 ONNX Runtime。电脑端不依赖 Qt SerialPort。
 2.  模型文件：由于体积较大，YOLO26 的 `.onnx` / `.pt` 模型文件不直接包含在代码库中，请根据需要自行放置到项目对应目录。默认文件名为 `yolo26s.onnx` / `yolo26n.onnx`。
 3.  编译运行：通过 Qt Creator 打开 `.pro` 工程文件，构建并运行。
+
+## 项目目录与维护
+
+- 根目录保留正式 Qt 源码、`untitled7.pro`、协议和无线控制说明。
+- `board/luckfox/`：当前板端服务、部署及驱动维护源码。
+- `board/stm32/`：OLED Wi-Fi 页面、PC13 短长按说明和针对正式下位机基线的固件补丁。
+- `tests/`：网络控制、跟踪/界面回归与当前视频节奏检查。
+- `tools/`：YOLO 模型转换示例与当前视频节奏分析。
+- `docs/deploy/`：部署及验收说明；`docs/learning/`：学习记录；`docs/archive/`：历史交接材料。
+- `build/`：Qt Creator 的正式 Debug/Release 构建目录；`tmp/`：本地诊断证据、SSH 维护资料和驱动构建工具，均不进入仓库。
+
+2026-10-11 已清理旧构建快照、未接入正式程序的 FFmpeg 播放实验及过时的 ONNX 1.18 下载脚本。当前 `.pro` 使用 ONNX Runtime 1.20.1；模型转换所需 `.pt` 和程序使用的 `.onnx` 继续保留。清理范围与恢复方法见 [清理报告](docs/learning/2026-10-11-09-project-cleanup.md)。
+
+下位机 OLED 已新增当前 Wi-Fi 名称页，PC13 短按切页、长按 1 秒切换自动/手动；长名称按字形滚动。Luckfox 配套脚本已部署，用户确认短按后当前名称显示正确；长按和长名称滚动的现场验收尚未执行。使用与协议说明见 [STM32 OLED Wi-Fi 页面](board/stm32/README.md)，实板证据见 [部署记录](docs/learning/2026-10-11-11-oled-wifi-deployment.md)。

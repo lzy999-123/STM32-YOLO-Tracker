@@ -423,6 +423,7 @@ class ServeLoopTests(unittest.TestCase):
                 mock.patch.object(bridge, 'open_embedded_discovery', return_value=responder,
                                   side_effect=OSError('address in use') if bind_failure else None), \
                 mock.patch.object(bridge.select, 'select', ready_once), \
+                mock.patch.object(bridge, 'WifiReporter') as wifi_factory, \
                 mock.patch.object(bridge, 'log'):
             with self.assertRaises(KeyboardInterrupt):
                 bridge.serve({'uart': '/dev/ttyS2', 'embedded_discovery': True}, None)
@@ -431,6 +432,9 @@ class ServeLoopTests(unittest.TestCase):
         self.assertTrue(any(packet['type'] == 'status' and packet['online'] for packet in replies))
         uart.read.assert_called_once()
         uart.close.assert_called_once()
+        wifi_factory.return_value.start.assert_called_once()
+        wifi_factory.return_value.tick.assert_called_once()
+        wifi_factory.return_value.close.assert_called_once()
         server.close.assert_called_once()
         if bind_failure:
             self.assertEqual(iterations[0], [server, 42])
@@ -466,12 +470,114 @@ class ServeLoopTests(unittest.TestCase):
         with mock.patch.object(bridge.socket, 'socket', return_value=server), \
                 mock.patch.object(bridge.select, 'select', fake_select), \
                 mock.patch.object(bridge.UartLink.__init__, '__defaults__', (FailingPort, bridge.time.monotonic)), \
+                mock.patch.object(bridge, 'WifiReporter'), \
                 mock.patch.object(bridge, 'log'):
             with self.assertRaises(KeyboardInterrupt):
                 bridge.serve({'uart': '/dev/ttyS2'}, None)
         self.assertEqual(calls['select'], 6)
         self.assertGreaterEqual(calls['sendto'], 5)
         self.assertEqual(FailingPort.opened, 1)
+
+
+class WifiStatusTests(unittest.TestCase):
+    def read(self, output, code=0):
+        with mock.patch.object(bridge.subprocess, 'run', return_value=
+                               bridge.subprocess.CompletedProcess([], code, output)) as run:
+            payload = bridge.read_wifi_status()
+        self.assertEqual(run.call_args.args[0], ['wpa_cli', '-i', 'wlan0', 'status'])
+        self.assertEqual(run.call_args.kwargs['timeout'], .5)
+        return payload
+
+    def test_reports_associated_ssid_and_preserves_equals_and_spaces(self):
+        self.assertEqual(self.read(b'ssid=Test Lab=2 \nwpa_state=COMPLETED\n'),
+                         b'\x02Test Lab=2 ')
+
+    def test_decodes_escaped_utf8_and_literal_backslash(self):
+        ssid = '\u6d4b\u8bd5-WiFi'.encode()
+        escaped = b''.join(('\\x%02x' % value).encode() for value in ssid)
+        self.assertEqual(self.read(b'wpa_state=COMPLETED\nssid=' + escaped + b'\n'),
+                         b'\x02' + ssid)
+        self.assertEqual(bridge.decode_wpa_ssid(br'Lab\\name\"\n\r\t\e'),
+                         b'Lab\\name"\n\r\t\x1b')
+
+    def test_full_32_byte_ssid_fits_uart_and_resynchronizes_after_bad_crc(self):
+        payload = self.read(b'wpa_state=COMPLETED\nssid=' + b'A' * 32 + b'\n')
+        wire = bridge.frame(bridge.WIFI_TYPE, payload)
+        parser = bridge.FrameParser()
+        self.assertEqual(parser.feed(wire[:12]), [])
+        self.assertEqual(parser.feed(wire[12:]), [(5, payload)])
+        bad = bytearray(wire)
+        bad[-1] ^= 1
+        self.assertEqual(parser.feed(bad + wire), [(5, payload)])
+
+    def test_disconnection_removes_old_name_even_when_wpa_keeps_ssid(self):
+        for state in (b'DISCONNECTED', b'SCANNING', b'ASSOCIATING'):
+            with self.subTest(state=state):
+                self.assertEqual(self.read(b'ssid=OldNetwork\nwpa_state=' + state + b'\n'), b'\x01')
+
+    def test_missing_and_failed_status_are_unknown(self):
+        for data, code in ((b'FAIL\n', 0), (b'', 1),
+                           (b'wpa_state=COMPLETED\n', 0),
+                           (b'wpa_state=COMPLETED\nssid=' + b'A' * 33 + b'\n', 0)):
+            with self.subTest(data=data, code=code):
+                self.assertEqual(self.read(data, code), b'\x00')
+        for error in (OSError('missing'), bridge.subprocess.TimeoutExpired('wpa_cli', .5)):
+            with mock.patch.object(bridge.subprocess, 'run', side_effect=error):
+                self.assertEqual(bridge.read_wifi_status(), b'\x00')
+
+    def test_reporter_sends_without_qt_peer_retries_and_expires(self):
+        now, writes = [10.0], []
+        reporter = bridge.WifiReporter(writes.append, clock=lambda: now[0])
+        reporter.payload, reporter.sample_time = b'\x02TestNetwork', now[0]
+        reporter.tick()
+        now[0] += 1
+        reporter.tick()
+        self.assertEqual(len(writes), 1)
+        now[0] += 1
+        reporter.tick()
+        self.assertEqual(writes, [bridge.frame(5, b'\x02TestNetwork')] * 2)
+        now[0] += 4
+        reporter.tick()
+        self.assertEqual(writes[-1], bridge.frame(5, b'\x00'))
+
+    def test_slow_probe_does_not_block_uart_or_write_from_worker(self):
+        entered, release = bridge.threading.Event(), bridge.threading.Event()
+        writes = []
+
+        def blocked_probe():
+            entered.set()
+            release.wait(1)
+            return b'\x02TestNetwork'
+
+        reporter = bridge.WifiReporter(writes.append, probe=blocked_probe)
+        reporter.start()
+        try:
+            self.assertTrue(entered.wait(.5))
+            reporter.tick()
+            self.assertEqual(writes, [bridge.frame(5, b'\x00')])
+            self.assertFalse(release.is_set())
+        finally:
+            release.set()
+            reporter.close()
+        self.assertFalse(reporter.thread.is_alive())
+        self.assertEqual(len(writes), 1)
+
+    def test_legacy_firmware_gets_no_metadata_and_capability_expires(self):
+        now, writes = [10.0], []
+        engine = bridge.Bridge(writes.append, clock=lambda: now[0])
+        reporter = bridge.WifiReporter(writes.append, clock=lambda: now[0])
+        engine.uart_frame(0x81, struct.pack('>BhhB', 0, 0, 0, 0))
+        reporter.tick(enabled=engine.wifi_ui_ready())
+        self.assertEqual(writes, [])
+        engine.uart_frame(0x84, b'\x02')
+        self.assertFalse(engine.wifi_ui_ready())
+        engine.uart_frame(0x84, b'\x01')
+        reporter.tick(enabled=engine.wifi_ui_ready())
+        self.assertEqual(writes, [bridge.frame(5, b'\x00')])
+        now[0] += 2.6
+        engine.uart_frame(0x81, struct.pack('>BhhB', 0, 0, 0, 0))
+        reporter.tick(enabled=engine.wifi_ui_ready())
+        self.assertEqual(len(writes), 1)
 
 
 spec_discovery = importlib.util.spec_from_file_location(

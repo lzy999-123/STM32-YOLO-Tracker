@@ -1,0 +1,376 @@
+--- a/Core/Src/main_gimbal.c
++++ b/Core/Src/main_gimbal.c
+@@ -10,6 +10,7 @@
+ #include "main.h"
+ #include "OLED.h"
+ #include "OLED_Text.h"
++#include "gimbal_button.h"
+ #include "gimbal_foc.h"
+ #include "gimbal_calibration.h"
+ 
+@@ -41,7 +42,7 @@
+ 
+ #define PROTO_SYNC1              0xA5U
+ #define PROTO_SYNC2              0x5AU
+-#define PROTO_MAX_LEN              32U
++#define PROTO_MAX_LEN              40U
+ #define PROTO_MAX_FRAME          (PROTO_MAX_LEN + 4U)
+ #define PROTO_RX_GAP_RESET_MS     500U
+ #define PROTO_QUEUE_SIZE            8U   /* power of two */
+@@ -50,9 +51,11 @@
+ #define PROTO_TYPE_CMD           0x02U
+ #define PROTO_TYPE_HEARTBEAT     0x03U
+ #define PROTO_TYPE_MANUAL_STEP   0x04U
++#define PROTO_TYPE_WIFI          0x05U
+ #define PROTO_TYPE_TELEMETRY     0x81U
+ #define PROTO_TYPE_ACK           0x82U
+ #define PROTO_TYPE_CALIBRATION   0x83U
++#define PROTO_TYPE_UI_CAPABILITY 0x84U
+ 
+ #define TELEMETRY_FLAG_FAULT      0x01U
+ #define TELEMETRY_FLAG_ESTOP      0x02U
+@@ -74,6 +77,11 @@
+ #define CALIBRATION_REPORT_INTERVAL_MS 1000U
+ #define SENSOR_CHECK_INTERVAL_MS   10U
+ #define OLED_SERVICE_INTERVAL_MS    4U
++#define WIFI_SSID_MAX_BYTES         32U
++#define WIFI_STATUS_TIMEOUT_MS   7000U
++#define WIFI_STATE_UNKNOWN           0U
++#define WIFI_STATE_DISCONNECTED      1U
++#define WIFI_STATE_CONNECTED         2U
+ 
+ /* IWDG: LSI ~40 kHz / 32 = 1.25 kHz, 625 counts => ~500 ms (LSI spread 30..60 kHz). */
+ #define IWDG_RELOAD_COUNT         625U
+@@ -150,14 +158,23 @@
+ static volatile uint32_t last_link_time;
+ static volatile uint8_t link_received; /* Display only: distinguish boot from a live link. */
+ 
++/* Luckfox network metadata is independent of the host control heartbeat. */
++static volatile uint8_t wifi_state;
++static volatile uint8_t wifi_seen;
++static volatile uint32_t wifi_time;
++static volatile char wifi_ssid[WIFI_SSID_MAX_BYTES + 1U];
++
+ /* Main-loop only. */
+ static uint8_t ack_queue[PROTO_QUEUE_SIZE];
+ static uint8_t ack_head;
+ static uint8_t ack_tail;
+ static uint8_t telemetry_pending;
+ static uint8_t calibration_report_pending;
++static uint8_t ui_capability_pending;
+ 
+ static uint8_t work_mode;
++static uint8_t oled_page; /* 0: gimbal status; 1: current Luckfox Wi-Fi. */
++static uint32_t wifi_scroll_start;
+ static uint8_t tracking_enable;
+ static uint8_t link_lost_latched;
+ 
+@@ -447,7 +464,16 @@
+         return;
+     }
+     if (calibration_report_pending) {
+-        if (Proto_SendCalibration() == HAL_OK) calibration_report_pending = 0U;
++        if (Proto_SendCalibration() == HAL_OK) {
++            calibration_report_pending = 0U;
++            ui_capability_pending = 1U;
++        }
++        return;
++    }
++    if (ui_capability_pending) {
++        const uint8_t version = 1U; /* Understands TYPE 0x05; metadata is not a heartbeat. */
++        if (Proto_SendFrame(PROTO_TYPE_UI_CAPABILITY, &version, 1U) == HAL_OK)
++            ui_capability_pending = 0U;
+         return;
+     }
+     if (ack_tail != ack_head) {
+@@ -539,6 +565,23 @@
+ static void Proto_Dispatch(uint8_t type, const uint8_t *payload, uint8_t length)
+ {
+     uint32_t now = HAL_GetTick();
++    if (type == PROTO_TYPE_WIFI) {
++        uint8_t i;
++        if (length < 1U || length > WIFI_SSID_MAX_BYTES + 1U ||
++            payload[0] > WIFI_STATE_CONNECTED ||
++            (payload[0] != WIFI_STATE_CONNECTED && length != 1U) ||
++            (payload[0] == WIFI_STATE_CONNECTED && length < 2U)) return;
++        wifi_state = payload[0];
++        for (i = 1U; i < length; i++) {
++            uint8_t byte = payload[i];
++            wifi_ssid[i - 1U] = (char)((byte < 0x20U || byte == 0x7FU) ? '?' : byte);
++        }
++        wifi_ssid[length - 1U] = '\0';
++        wifi_time = now;
++        wifi_seen = 1U;
++        /* Never refresh last_link_time: Wi-Fi alone cannot keep control alive. */
++        return;
++    }
+     last_link_time = now;
+     link_received = 1U;
+     if (type == PROTO_TYPE_TRACK && length == 4U) {
+@@ -772,10 +815,17 @@
+ 
+ static void HandleButtons(void)
+ {
+-    if (Button_Pressed(KEY_MODE_PORT, KEY_MODE_PIN, 0U)) {
++    static GimbalButton mode_key;
++    uint8_t event = GimbalButton_Update(&mode_key,
++        HAL_GPIO_ReadPin(KEY_MODE_PORT, KEY_MODE_PIN) == GPIO_PIN_RESET, HAL_GetTick());
++    if (event == GIMBAL_BUTTON_SHORT) {
++        oled_page = !oled_page;
++        wifi_scroll_start = HAL_GetTick();
++        Buzzer_On(30U);
++    } else if (event == GIMBAL_BUTTON_LONG) {
+         work_mode = !work_mode;
+         CenterGimbal();
+-        Buzzer_On(50U);
++        Buzzer_On(100U);
+     }
+     if (Button_Pressed(KEY_CENTER_PORT, KEY_CENTER_PIN, 1U)) {
+         tracking_enable = 0U;
+@@ -913,6 +963,55 @@
+ }
+ 
+ /* Only updates the OLED text buffer; OLED_Service() draws it incrementally. */
++static void Status_ShowWifi(void)
++{
++    static char previous_ssid[WIFI_SSID_MAX_BYTES + 1U];
++    static uint8_t previous_state;
++    char ssid[WIFI_SSID_MAX_BYTES + 1U];
++    char text[64];
++    uint32_t primask = __get_PRIMASK();
++    uint32_t received;
++    uint8_t state;
++    uint8_t seen;
++    uint8_t i;
++    uint32_t link_time;
++    uint8_t link_seen;
++    uint32_t elapsed;
++    uint32_t offset;
++    uint32_t now;
++    __disable_irq();
++    state = wifi_state;
++    received = wifi_time;
++    seen = wifi_seen;
++    link_time = last_link_time;
++    link_seen = link_received;
++    for (i = 0U; i < sizeof(ssid); i++) ssid[i] = wifi_ssid[i];
++    __set_PRIMASK(primask);
++    now = HAL_GetTick();
++    if (!seen || now - received > WIFI_STATUS_TIMEOUT_MS)
++        state = WIFI_STATE_UNKNOWN;
++    if (state != previous_state || strcmp(ssid, previous_ssid) != 0) {
++        memcpy(previous_ssid, ssid, sizeof(ssid));
++        previous_state = state;
++        wifi_scroll_start = now;
++    }
++    if (state == WIFI_STATE_CONNECTED) {
++        OLED_SetLine(1U, "WiFi " OLED_TXT_WIFI_CONNECTED);
++        elapsed = now - wifi_scroll_start;
++        offset = elapsed < 1500U ? 0U : 1U + (elapsed - 1500U) / 500U;
++        OLED_SetScrollingLine(2U, ssid, offset);
++    } else {
++        OLED_SetLine(1U, state == WIFI_STATE_DISCONNECTED
++                     ? "WiFi " OLED_TXT_WIFI_DISCONNECTED : "WiFi " OLED_TXT_WIFI_WAIT);
++        OLED_SetLine(2U, "--");
++    }
++    snprintf(text, sizeof(text), "%s  %s", work_mode ? OLED_TXT_AUTO : OLED_TXT_MANUAL,
++             !link_seen ? OLED_TXT_LINK_WAIT :
++             (now - link_time > LINK_TIMEOUT_MS ? OLED_TXT_LINK_DOWN : OLED_TXT_LINK_OK));
++    OLED_SetLine(3U, text);
++    OLED_SetLine(4U, "PC13 " OLED_TXT_PAGE_HINT);
++}
++
+ static void Status_Update(void)
+ {
+     uint32_t link_time;
+@@ -935,6 +1034,10 @@
+         OLED_SetLine(2U, "  " OLED_TXT_OUTPUT_OFF);
+         OLED_SetLine(3U, OLED_TXT_CONFIRM_SAFE);
+         OLED_SetLine(4U, OLED_TXT_STOP_RELEASE);
++        return;
++    }
++    if (oled_page != 0U) {
++        Status_ShowWifi();
+         return;
+     }
+     primask = __get_PRIMASK();
+--- a/Core/Src/OLED.c
++++ b/Core/Src/OLED.c
+@@ -359,6 +359,40 @@
+ 	while (column < OLED_COLUMNS) oled_target[Line - 1U][column++] = ' ';
+ }
+ 
++void OLED_SetScrollingLine(uint8_t Line, const char *String, uint32_t Offset)
++{
++	uint16_t glyphs[35]; /* SSIDs contain at most 32 bytes plus three spaces. */
++	uint8_t count = 0U;
++	uint8_t columns = 0U;
++	uint8_t index;
++	uint8_t column = 0U;
++	const uint8_t *p = (const uint8_t *)String;
++	uint16_t glyph;
++	uint8_t width;
++	if (Line < 1U || Line > OLED_LINES) return;
++	while (p != NULL && *p != 0U && count < 32U) {
++		glyph = OLED_FindGlyph(OLED_DecodeUTF8(&p));
++		glyphs[count++] = glyph;
++		columns = (uint8_t)(columns + (glyph >= OLED_CHINESE_BASE ? 2U : 1U));
++	}
++	if (columns <= OLED_COLUMNS) {
++		OLED_SetLine(Line, String);
++		return;
++	}
++	for (index = 0U; index < 3U; index++) glyphs[count++] = ' ';
++	index = (uint8_t)(Offset % count);
++	OLED_SetLine(Line, "");
++	while (column < OLED_COLUMNS) {
++		glyph = glyphs[index];
++		width = glyph >= OLED_CHINESE_BASE ? 2U : 1U;
++		if (column + width > OLED_COLUMNS) break;
++		oled_target[Line - 1U][column++] = glyph;
++		if (width == 2U)
++			oled_target[Line - 1U][column++] = (uint16_t)(glyph | OLED_RIGHT_HALF);
++		index = (uint8_t)((index + 1U) % count);
++	}
++}
++
+ static void OLED_RenderSlot(uint16_t slot, uint8_t half, uint8_t *pixels)
+ {
+ 	uint16_t glyph = (uint16_t)(slot & ~OLED_RIGHT_HALF);
+--- a/Core/Inc/OLED.h
++++ b/Core/Inc/OLED.h
+@@ -14,6 +14,9 @@
+ /* Buffered UTF-8 text: 4 rows of 128 pixels; Chinese 16x16, ASCII/degree 8x16.
+  * SetLine only edits RAM. Service transmits at most one 8x8 block per call. */
+ void OLED_SetLine(uint8_t Line, const char *String);
++/* One-row marquee for <=32 glyphs. Offset counts glyphs, never UTF-8 bytes.
++ * Text fitting one row stays still; long text repeats with three blank slots. */
++void OLED_SetScrollingLine(uint8_t Line, const char *String, uint32_t Offset);
+ uint8_t OLED_Service(void);
+ 
+ #endif
+--- /dev/null
++++ b/Core/Inc/gimbal_button.h
+@@ -0,0 +1,62 @@
++#ifndef GIMBAL_BUTTON_H
++#define GIMBAL_BUTTON_H
++
++#include <stdint.h>
++
++#define GIMBAL_BUTTON_DEBOUNCE_MS 30U
++#define GIMBAL_BUTTON_LONG_MS 1000U
++#define GIMBAL_BUTTON_NONE 0U
++#define GIMBAL_BUTTON_SHORT 1U
++#define GIMBAL_BUTTON_LONG 2U
++
++typedef struct {
++    uint32_t raw_since;
++    uint32_t pressed_at;
++    uint8_t initialized;
++    uint8_t raw_down;
++    uint8_t stable_down;
++    uint8_t suppress;
++    uint8_t long_sent;
++} GimbalButton;
++
++/* Main-loop polling only. Unsigned elapsed times also handle tick wrap. */
++static uint8_t GimbalButton_Update(GimbalButton *key, uint8_t down, uint32_t now)
++{
++    if (!key->initialized) {
++        key->initialized = 1U;
++        key->raw_down = key->stable_down = down;
++        key->raw_since = key->pressed_at = now;
++        /* A key held through startup/calibration must be released first. */
++        key->suppress = down;
++        return GIMBAL_BUTTON_NONE;
++    }
++    if (down != key->raw_down) {
++        key->raw_down = down;
++        key->raw_since = now;
++    }
++    if (key->raw_down != key->stable_down &&
++        now - key->raw_since >= GIMBAL_BUTTON_DEBOUNCE_MS) {
++        key->stable_down = key->raw_down;
++        if (key->stable_down) {
++            key->pressed_at = key->raw_since;
++            key->long_sent = 0U;
++        } else {
++            uint8_t event = GIMBAL_BUTTON_NONE;
++            if (!key->suppress && !key->long_sent) {
++                /* Use the release edge, excluding release debounce time. */
++                event = key->raw_since - key->pressed_at >= GIMBAL_BUTTON_LONG_MS
++                        ? GIMBAL_BUTTON_LONG : GIMBAL_BUTTON_SHORT;
++            }
++            key->suppress = 0U;
++            return event;
++        }
++    }
++    if (key->stable_down && key->raw_down && !key->suppress && !key->long_sent &&
++        now - key->pressed_at >= GIMBAL_BUTTON_LONG_MS) {
++        key->long_sent = 1U;
++        return GIMBAL_BUTTON_LONG;
++    }
++    return GIMBAL_BUTTON_NONE;
++}
++
++#endif
+--- a/Core/Inc/OLED_Text.h
++++ b/Core/Inc/OLED_Text.h
+@@ -58,4 +58,8 @@
+ #define OLED_TXT_STARTUP "\xE6\xAD\xA3\xE5\x9C\xA8\xE5\x90\xAF\xE5\x8A\xA8" /* 正在启动 */
+ #define OLED_TXT_INIT "\xE5\x88\x9D\xE5\xA7\x8B\xE5\x8C\x96\xE8\xAE\xBE\xE5\xA4\x87" /* 初始化设备 */
+ #define OLED_TXT_PLEASE_WAIT "\xE8\xAF\xB7\xE7\xA8\x8D\xE5\x80\x99" /* 请稍候 */
++#define OLED_TXT_WIFI_CONNECTED "\xE5\xB7\xB2\xE8\xBF\x9E\xE6\x8E\xA5" /* 已连接 */
++#define OLED_TXT_WIFI_DISCONNECTED "\xE6\x9C\xAA\xE8\xBF\x9E\xE6\x8E\xA5" /* 未连接 */
++#define OLED_TXT_WIFI_WAIT "\xE7\xAD\x89\xE5\xBE\x85\xE6\x9B\xB4\xE6\x96\xB0" /* 等待更新 */
++#define OLED_TXT_PAGE_HINT "\xE7\x9F\xAD\xE6\x8C\x89\xE5\x88\x87\xE9\xA1\xB5" /* 短按切页 */
+ #endif
+--- a/Core/Inc/OLED_Chinese_Font.h
++++ b/Core/Inc/OLED_Chinese_Font.h
+@@ -18,6 +18,7 @@
+     {0x51C6U, {0x00, 0x0C, 0x18, 0x30, 0x40, 0xE0, 0xFC, 0xDE, 0x90, 0x90, 0xF6, 0x94, 0x90, 0x90, 0x10, 0x00, 0x00, 0x30, 0x1C, 0x07, 0x00, 0x00, 0xFF, 0x64, 0x24, 0x24, 0x3F, 0x24, 0x24, 0x24, 0x20, 0x00}}, /* 准 */
+     {0x51FAU, {0x00, 0x00, 0x78, 0xF8, 0x80, 0x80, 0x80, 0xFE, 0xFE, 0x80, 0x80, 0x80, 0xF8, 0x78, 0x00, 0x00, 0x00, 0x00, 0x7E, 0x60, 0x60, 0x60, 0x60, 0x7F, 0x7F, 0x60, 0x60, 0x60, 0x60, 0xFE, 0x00, 0x00}}, /* 出 */
+     {0x5206U, {0x00, 0x80, 0xC0, 0xE0, 0xB8, 0x8C, 0x84, 0x80, 0x80, 0x86, 0x9C, 0xB0, 0xE0, 0xC0, 0xC0, 0x00, 0x00, 0x00, 0x40, 0x60, 0x30, 0x18, 0x0F, 0x01, 0x00, 0x40, 0x60, 0x3F, 0x00, 0x00, 0x00, 0x00}}, /* 分 */
++    {0x5207U, {0x00, 0x40, 0x40, 0xFE, 0x40, 0x40, 0x40, 0x0C, 0x0C, 0xFC, 0xFC, 0x0C, 0x0C, 0xFC, 0xF8, 0x00, 0x00, 0x00, 0x10, 0x1F, 0x18, 0x4C, 0x64, 0x30, 0x1C, 0x07, 0x00, 0x40, 0x60, 0x7F, 0x01, 0x00}}, /* 切 */
+     {0x521DU, {0x00, 0x10, 0x10, 0x92, 0xF6, 0x30, 0x80, 0x8C, 0x0C, 0xFC, 0xFC, 0x0C, 0x0C, 0xFC, 0xF8, 0x00, 0x00, 0x06, 0x03, 0x7F, 0x7F, 0x03, 0x47, 0x60, 0x38, 0x0F, 0x00, 0x40, 0x60, 0x7F, 0x00, 0x00}}, /* 初 */
+     {0x5230U, {0x00, 0xC4, 0xC4, 0xF4, 0xDC, 0xC4, 0xC4, 0x74, 0xC4, 0x00, 0xF8, 0x00, 0x00, 0xFE, 0xFE, 0x00, 0x00, 0x64, 0x64, 0x64, 0x3F, 0x3F, 0x24, 0x24, 0x24, 0x00, 0x0F, 0x40, 0xC0, 0x7F, 0x3F, 0x00}}, /* 到 */
+     {0x52A8U, {0x00, 0xC8, 0xC8, 0xC8, 0xC8, 0xC8, 0xC8, 0xC0, 0x20, 0x20, 0xFE, 0xFE, 0x20, 0x20, 0xE0, 0x00, 0x00, 0x10, 0x1C, 0x13, 0x10, 0x18, 0x1E, 0x58, 0x60, 0x38, 0x0F, 0x40, 0x40, 0x78, 0x3F, 0x00}}, /* 动 */
+@@ -62,6 +63,7 @@
+     {0x6545U, {0x00, 0x20, 0x20, 0x30, 0xFC, 0x20, 0x20, 0xE0, 0x60, 0xFC, 0x16, 0x10, 0xF0, 0x70, 0x10, 0x00, 0x00, 0x3E, 0x3F, 0x11, 0x11, 0x33, 0x3F, 0x40, 0x60, 0x23, 0x1C, 0x1C, 0x27, 0x60, 0x40, 0x00}}, /* 故 */
+     {0x65ADU, {0x00, 0xFC, 0xF8, 0x5C, 0xD0, 0xFE, 0xFC, 0x58, 0x4C, 0x00, 0xFC, 0x44, 0xC4, 0xC4, 0x44, 0x00, 0x00, 0x3F, 0x3F, 0x26, 0x23, 0x2F, 0x2F, 0x23, 0x66, 0x3E, 0x07, 0x00, 0x00, 0x7F, 0x00, 0x00}}, /* 断 */
+     {0x65B0U, {0x00, 0xC8, 0xD8, 0xE8, 0xCE, 0xCE, 0xF8, 0xC8, 0x00, 0xFC, 0xFC, 0x44, 0x46, 0xC6, 0x42, 0x00, 0x00, 0x32, 0x1A, 0xCA, 0x7F, 0x3F, 0x0A, 0x12, 0xE2, 0x3F, 0x07, 0x00, 0x00, 0xFF, 0x00, 0x00}}, /* 新 */
++    {0x66F4U, {0x00, 0x04, 0x04, 0xF4, 0x94, 0x94, 0x94, 0xFC, 0xFC, 0x94, 0x94, 0x94, 0xF4, 0x04, 0x04, 0x00, 0x00, 0x40, 0xC0, 0x43, 0x4E, 0x3A, 0x32, 0x3F, 0x27, 0x62, 0x42, 0x42, 0x43, 0x40, 0x40, 0x00}}, /* 更 */
+     {0x672AU, {0x00, 0x80, 0x90, 0x90, 0x90, 0x90, 0x90, 0xFE, 0xFE, 0x90, 0x90, 0x90, 0x90, 0x80, 0x80, 0x00, 0x00, 0x20, 0x30, 0x18, 0x0C, 0x06, 0x03, 0x7F, 0x7F, 0x07, 0x0C, 0x18, 0x10, 0x30, 0x20, 0x00}}, /* 未 */
+     {0x673AU, {0x00, 0x30, 0x90, 0xFE, 0xFC, 0x90, 0x10, 0x00, 0xFC, 0x04, 0x04, 0xFC, 0xFC, 0x00, 0x00, 0x00, 0x00, 0x0E, 0x07, 0x7F, 0x7F, 0x03, 0x62, 0x38, 0x0F, 0x00, 0x00, 0x3F, 0x7F, 0x40, 0x60, 0x00}}, /* 机 */
+     {0x677EU, {0x00, 0x20, 0xA0, 0xFE, 0xFE, 0x20, 0x80, 0xE0, 0x3C, 0x84, 0x80, 0x1E, 0x38, 0xE0, 0x80, 0x00, 0x00, 0x0C, 0x07, 0x7F, 0x7F, 0x03, 0x02, 0x60, 0x7C, 0x27, 0x21, 0x20, 0x3C, 0x78, 0x60, 0x00}}, /* 松 */
+@@ -76,6 +78,7 @@
+     {0x7535U, {0x00, 0x00, 0xF0, 0x90, 0x90, 0x90, 0x98, 0xFE, 0x90, 0x90, 0x90, 0x90, 0xF0, 0x00, 0x00, 0x00, 0x00, 0x00, 0x1F, 0x0C, 0x0C, 0x0C, 0x0C, 0x7F, 0x4C, 0xCC, 0xCC, 0xCC, 0xCF, 0x40, 0x60, 0x00}}, /* 电 */
+     {0x76EEU, {0x00, 0x00, 0x00, 0xFC, 0x64, 0x64, 0x64, 0x64, 0x64, 0x64, 0x64, 0x64, 0xFC, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x7F, 0x22, 0x22, 0x22, 0x22, 0x22, 0x22, 0x22, 0x22, 0x7F, 0x00, 0x00, 0x00}}, /* 目 */
+     {0x76F4U, {0x00, 0x00, 0x08, 0xE8, 0xE8, 0xA8, 0xA8, 0xBE, 0xAE, 0xA8, 0xA8, 0xE8, 0xE8, 0x08, 0x00, 0x00, 0x00, 0x40, 0x40, 0x7F, 0x7F, 0x5A, 0x5A, 0x5A, 0x5A, 0x5A, 0x5A, 0x7F, 0x7F, 0x40, 0x40, 0x00}}, /* 直 */
++    {0x77EDU, {0x00, 0x38, 0x1E, 0x98, 0xF8, 0x18, 0x00, 0x04, 0xE4, 0x24, 0x24, 0x24, 0x24, 0xE4, 0x04, 0x00, 0x00, 0x61, 0x31, 0x1F, 0x0F, 0x19, 0x11, 0x40, 0x4F, 0x5B, 0x43, 0x63, 0x7F, 0x4F, 0x40, 0x00}}, /* 短 */
+     {0x7801U, {0x00, 0x04, 0xC4, 0xFC, 0x44, 0xC4, 0x84, 0x04, 0xF4, 0x14, 0x04, 0x04, 0xFC, 0x0C, 0x00, 0x00, 0x00, 0x03, 0x3F, 0x3F, 0x18, 0x1F, 0x1F, 0x08, 0x09, 0x09, 0x09, 0xC9, 0x49, 0x7D, 0x1F, 0x00}}, /* 码 */
+     {0x786EU, {0x00, 0x00, 0xCC, 0xFC, 0x8C, 0x8C, 0x20, 0x38, 0xEC, 0x2E, 0xEC, 0xFC, 0x2C, 0x60, 0xE0, 0x00, 0x00, 0x03, 0x7F, 0x18, 0x18, 0x3F, 0x40, 0x78, 0x1F, 0x09, 0x7F, 0x7F, 0x09, 0xCD, 0x7F, 0x00}}, /* 确 */
+     {0x7A0DU, {0x00, 0x64, 0x64, 0xFC, 0xFC, 0x66, 0x00, 0xC4, 0xDC, 0x40, 0x7E, 0x7E, 0x40, 0xCC, 0xC4, 0x00, 0x00, 0x0C, 0x07, 0x7F, 0x7F, 0x07, 0x04, 0x7F, 0xFF, 0x0B, 0x0B, 0x0B, 0xCB, 0xFF, 0x7F, 0x00}}, /* 稍 */
+@@ -115,9 +118,10 @@
+     {0x969CU, {0x00, 0xFC, 0x04, 0xE4, 0xBC, 0x04, 0x20, 0xA8, 0xB8, 0xAE, 0xAE, 0xB8, 0xB8, 0xA8, 0x20, 0x00, 0x00, 0x7F, 0x00, 0x08, 0x0F, 0x06, 0x20, 0x2F, 0x2E, 0x3E, 0xFE, 0x2E, 0x2E, 0x2F, 0x20, 0x00}}, /* 障 */
+     {0x96F6U, {0x00, 0x38, 0x18, 0xAA, 0xAA, 0xAA, 0x0A, 0xFE, 0xFE, 0x0A, 0xAA, 0xAA, 0x2A, 0x18, 0x38, 0x00, 0x00, 0x0C, 0x04, 0x04, 0x0E, 0x2A, 0x29, 0x6F, 0x69, 0x7B, 0x4A, 0x06, 0x04, 0x04, 0x04, 0x00}}, /* 零 */
+     {0x9700U, {0x00, 0x38, 0x18, 0xAA, 0xAA, 0xAA, 0x0A, 0xFE, 0xFE, 0x0A, 0xAA, 0xAA, 0x0A, 0x1A, 0x38, 0x00, 0x00, 0x02, 0x7A, 0x0A, 0x0A, 0x0A, 0x7A, 0x0E, 0x0A, 0x7A, 0x0A, 0x0A, 0x4A, 0x7A, 0x02, 0x00}}, /* 需 */
++    {0x9875U, {0x00, 0x04, 0x04, 0xE4, 0xE4, 0x24, 0x24, 0xBC, 0x3C, 0x24, 0x24, 0x64, 0xE4, 0x04, 0x04, 0x00, 0x00, 0x40, 0xC0, 0x4F, 0x6F, 0x20, 0x18, 0x0F, 0x01, 0x10, 0x30, 0x20, 0x6F, 0x40, 0x00, 0x00}}, /* 页 */
+     {0x9884U, {0x00, 0x84, 0x94, 0xB4, 0xBC, 0x8C, 0x80, 0x04, 0xE4, 0x24, 0xBC, 0xA4, 0x24, 0xE4, 0x04, 0x00, 0x00, 0x00, 0x40, 0x7F, 0x00, 0x00, 0x01, 0xC0, 0x6F, 0x30, 0x1F, 0x01, 0x20, 0x6F, 0x40, 0x00}}, /* 预 */
+     {0x9A71U, {0x00, 0xF4, 0xF4, 0x04, 0x04, 0xFC, 0x00, 0x00, 0xFC, 0x24, 0x64, 0xC4, 0xC4, 0x74, 0x04, 0x00, 0x00, 0x19, 0x0B, 0x0A, 0xCB, 0x63, 0x7E, 0x00, 0x7F, 0x40, 0x4C, 0x47, 0x43, 0x4E, 0x48, 0x00}}, /* 驱 */
+ };
+-#define OLED_CHINESE_COUNT 113U
++#define OLED_CHINESE_COUNT 117U
+ static const uint8_t OLED_Degree8x16[16] = {0x00, 0x00, 0x18, 0x24, 0x24, 0x18, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00};
+ #endif
+--- a/tools/generate_oled_font.py
++++ b/tools/generate_oled_font.py
+@@ -34,6 +34,8 @@
+     'ST_DONE': '校准完成', 'ST_F_WAIT': '正向稳定',
+     'ST_R_WAIT': '反向稳定', 'ST_NONE': '准备阶段', 'RUN': '运行',
+     'STARTUP': '正在启动', 'INIT': '初始化设备', 'PLEASE_WAIT': '请稍候',
++    'WIFI_CONNECTED': '已连接', 'WIFI_DISCONNECTED': '未连接',
++    'WIFI_WAIT': '等待更新', 'PAGE_HINT': '短按切页',
+ }
+ 
+ 

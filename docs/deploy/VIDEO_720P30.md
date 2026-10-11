@@ -1,5 +1,9 @@
 # 720p30 视频链路与连续性验收
 
+## 2026-10-11 项目清理
+
+当前视频仍使用下文的 OpenCV/TCP 优先链路。未接入正式构建的 `rtspdecoder.*`、`rtspstreamhealth.h`、`videoplayout.h` 及其专用单元测试已从工作树移除，需要研究时可从阶段提交 `38f1365135b4f073a19bd16bd4984a2d53f57265` 恢复。`tests/video_cadence_probe.*`、`tools/analyze_video_cadence.py` 及分析器回归测试仍用于当前正式链路，继续保留。后面的原生 FFmpeg 实验内容是历史记录；清理范围见 [项目清理报告](../learning/2026-10-11-09-project-cleanup.md)。
+
 ## 2026-10-11 连接失败修复
 
 回退后的首次建联失败已定位到板端：`rkipc` 收到 SIGTERM 退出，554 无监听，控制服务仍在线。已经恢复视频，并部署 `S99zzzvideo` 统一原厂与 init 的视频启动入口、退出退避恢复、正常停止和小日志限制；视频配置保持原样。安装与维护方法见 [板端视频服务](../../board/luckfox/README.md#视频服务退出后的恢复)。

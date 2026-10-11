@@ -1,9 +1,0 @@
-QT += core testlib
-QT -= gui
-CONFIG += console testcase c++17 release
-CONFIG -= debug debug_and_release
-TARGET = videoplayout_test
-SOURCES = videoplayout_test.cpp
-HEADERS = ../videoplayout.h ../rtspdecoder.h ../rtspstreamhealth.h
-INCLUDEPATH += .. D:/opencv_build/build/install/include
-LIBS += -LD:/opencv_build/build/install/x64/vc17/lib -lopencv_core4120

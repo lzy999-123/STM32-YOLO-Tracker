@@ -1,1 +1,2 @@
 /board/luckfox/** text eol=lf
+/board/stm32/patches/*.patch text eol=lf -whitespace

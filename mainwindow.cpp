@@ -1,4 +1,5 @@
 #include "mainwindow.h"
+#include "trackingdiagnostics.h"
 #include "ui_mainwindow.h"
 
 #include <QCameraDevice>
@@ -126,6 +127,10 @@ MainWindow::MainWindow(QWidget *parent, bool autoConnect)
     setupNetworkUi();
     testDNN();
 
+    m_trackFlushTimer.setSingleShot(true);
+    m_trackFlushTimer.setTimerType(Qt::PreciseTimer);
+    connect(&m_trackFlushTimer, &QTimer::timeout, this, &MainWindow::flushTrackData);
+
     // CSRT 在后台线程运行，targetTracked/targetLost 以排队方式送达；停止或重新开始后，
     // 旧会话残留的信号仍可能到达。按会话代号丢弃旧信号，避免停止后继续下发旧偏移。
     connect(&m_trackingEngine, &TrackingEngine::targetTracked, this,
@@ -202,6 +207,9 @@ MainWindow::MainWindow(QWidget *parent, bool autoConnect)
     connect(&m_networkController, &NetworkController::telemetryReceived, this,
             [this](int mode, float horizontal, float vertical) {
         const int flags = m_networkController.telemetryFlags();
+        if (trackingDiagnosticsEnabled())
+            qInfo("[TrackTrace] kind=telemetry t=%lld mode=%d horizontal=%.2f vertical=%.2f flags=%d",
+                  trackingClockMs(), mode, double(horizontal), double(vertical), flags);
         QString alarm;
         if (flags & NetworkController::FlagFault) alarm += QStringLiteral(" · 下位机故障");
         if (flags & NetworkController::FlagEmergencyStop) alarm += QStringLiteral(" · 急停");
@@ -506,10 +514,19 @@ void MainWindow::flushTrackData()
         QMutexLocker modeLocker(&m_modeMutex);
         if (m_currentMode != 1) return;
     }
-    // 只在有新结果时发送，且保留 20ms 最小间隔；被限流的结果在下一帧补发最新值。
+    // Preserve the 20ms send limit without waiting for another video frame.
     const qint64 currentTime = QDateTime::currentMSecsSinceEpoch();
-    if (currentTime - m_lastControlSendTime < 20) return;
+    const qint64 remaining = 20 - (currentTime - m_lastControlSendTime);
+    if (remaining > 0) {
+        if (!m_trackFlushTimer.isActive()) m_trackFlushTimer.start(static_cast<int>(remaining));
+        return;
+    }
+    m_trackFlushTimer.stop();
     const QPoint offsets = controlOffsets();
+    if (trackingDiagnosticsEnabled())
+        qInfo("[TrackTrace] kind=send t=%lld generation=%llu result=%llu x=%d y=%d",
+              trackingClockMs(), m_trackingEngine.trackingGeneration(), m_lastTrackResultSeq,
+              offsets.x(), offsets.y());
     m_networkController.sendTrackData(static_cast<int16_t>(std::clamp(offsets.x(), -32768, 32767)),
                                       static_cast<int16_t>(std::clamp(offsets.y(), -32768, 32767)));
     m_lastControlSendTime = currentTime;
@@ -674,6 +691,7 @@ void MainWindow::openNetworkControl(const QString &source)
 
 void MainWindow::stopLocalControl()
 {
+    m_trackFlushTimer.stop();
     m_isCapturing = m_isSelecting = m_hasSelectedTarget = m_isTargetTracked = false;
     m_wasTrackingBeforeDisconn = false;
     m_selectedRect = m_trackedRect = cv::Rect2d();

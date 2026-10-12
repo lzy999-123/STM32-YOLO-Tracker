@@ -1,4 +1,8 @@
 #include "mainwindow.h"
+#include "luckfoxnetworkroute.h"
+#include "yoloinputgeometry.h"
+#include <QSettings>
+#include <QScopeGuard>
 #include <QtTest>
 #include <QMessageBox>
 #include <QJsonDocument>
@@ -12,6 +16,7 @@
 #include <QTcpServer>
 #include <QTcpSocket>
 #include <chrono>
+#include <array>
 
 class TrackingConcurrencyTest : public QObject
 {
@@ -30,6 +35,11 @@ private slots:
     void staleTrackingSignalsAreDroppedByGeneration();
     void trackDataOnlyForNewResults();
     void engineHoldAndStaleDnnSessionGiveNoOffset();
+    void yoloResultsReachControlWithoutAnotherVideoFrame();
+    void discoveryPrefersEthernetAndFallsBackToWifi();
+    void yoloLetterboxPreservesImageAndControlCoordinates();
+    void yoloSizeChangesDoNotMoveControlCenter();
+    void yoloPublicImageMatchesOfficialReference();
     void installationCorrectionPreservesControlOffsets();
     void installedCameraTrackingDirections_data();
     void installedCameraTrackingDirections();
@@ -46,6 +56,92 @@ private slots:
     void rtspWatchdogUsesHistoricalTimeout();
 
 };
+
+void TrackingConcurrencyTest::yoloSizeChangesDoNotMoveControlCenter()
+{
+    TrackingEngine engine;
+    engine.m_isCapturing = true;
+    engine.m_frameSize = cv::Size(1280, 720);
+    for (const cv::Size size : {cv::Size(80, 100), cv::Size(240, 300),
+                               cv::Size(60, 80), cv::Size(180, 200)}) {
+        engine.onDnnResultReceived(cv::Rect2d(640 - size.width / 2,
+                                              360 - size.height / 2,
+                                              size.width, size.height), true, "cell phone");
+        QCOMPARE(engine.currentOffsetX(), 0);
+        QCOMPARE(engine.currentOffsetY(), 0);
+        QCOMPARE(engine.currentTrackedRect().width, double(size.width));
+    }
+    engine.onDnnResultReceived(cv::Rect2d(720, 390, 80, 100), true, "cell phone");
+    QCOMPARE(engine.currentOffsetX(), 120);
+    QCOMPARE(engine.currentOffsetY(), 80);
+}
+
+void TrackingConcurrencyTest::yoloPublicImageMatchesOfficialReference()
+{
+    const QString root = qEnvironmentVariable("QT_YOLO_REFERENCE_ROOT");
+    if (root.isEmpty()) QSKIP("Set QT_YOLO_REFERENCE_ROOT to test the real exported model.");
+    const cv::Mat frame = cv::imread((root + "/tools/bus.jpg").toStdString());
+    QVERIFY(!frame.empty());
+    DnnThread thread(root + "/yolo26s.onnx");
+    QSignalSpy results(&thread, &DnnThread::yoloDetectionResult);
+    thread.start();
+    auto cleanup = qScopeGuard([&] { thread.requestInterruption(); thread.stopDnn(); thread.wait(); });
+    QTRY_VERIFY_WITH_TIMEOUT(thread.isWarmedUp() || thread.isLoadFailed(), 60000);
+    QVERIFY(thread.isWarmedUp());
+    thread.requestDetections(frame, 42);
+    QTRY_VERIFY_WITH_TIMEOUT(!results.empty() && results.last().at(4).toBool(), 10000);
+    // Ultralytics 8.4.80, ONNX Runtime CPU, public bus.jpg, imgsz=640.
+    // Compare class, confidence and every edge through production preprocessing
+    // and output decoding (GPU round-off and integer box rounding allowed).
+    const std::array<cv::Rect2d, 5> boxes = {{
+        {6.298, 229.608, 796.771, 511.847},
+        {668.058, 392.172, 141.942, 488.223},
+        {49.441, 398.939, 197.243, 504.024},
+        {222.079, 406.977, 122.091, 454.394},
+        {0, 550.283, 77.802, 324.589}}};
+    const std::array<float, 5> confidence = {{0.969829f, 0.943062f, 0.937683f, 0.911363f, 0.629834f}};
+    QCOMPARE(results.size(), 6);
+    for (int i = 0; i < 5; ++i) {
+        const auto result = results.at(i);
+        QCOMPARE(result.at(1).toInt(), i == 0 ? 5 : 0);
+        QVERIFY(std::abs(result.at(2).toFloat() - confidence[i]) < 0.015f);
+        const cv::Rect2d actual = qvariant_cast<cv::Rect2d>(result.at(0));
+        QVERIFY(std::abs(actual.x - boxes[i].x) < 2.0);
+        QVERIFY(std::abs(actual.y - boxes[i].y) < 2.0);
+        QVERIFY(std::abs(actual.width - boxes[i].width) < 2.0);
+        QVERIFY(std::abs(actual.height - boxes[i].height) < 2.0);
+    }
+
+}
+
+void TrackingConcurrencyTest::yoloLetterboxPreservesImageAndControlCoordinates()
+{
+    for (const cv::Size sourceSize : {cv::Size(1280, 720), cv::Size(720, 1280),
+                                     cv::Size(640, 640), cv::Size(960, 541)}) {
+        YoloInputGeometry geometry(sourceSize);
+        cv::Mat image(sourceSize, CV_8UC3, cv::Scalar(11, 22, 33));
+        const cv::Mat input = geometry.prepare(image);
+        QCOMPARE(input.cols, 640); QCOMPARE(input.rows, 640);
+        QCOMPARE(input.at<cv::Vec3b>(320, 320), cv::Vec3b(11, 22, 33));
+        if (geometry.top) QCOMPARE(input.at<cv::Vec3b>(0, 320), cv::Vec3b(114, 114, 114));
+        if (geometry.left) QCOMPARE(input.at<cv::Vec3b>(320, 0), cv::Vec3b(114, 114, 114));
+        const cv::Rect expected(sourceSize.width / 3, sourceSize.height / 4, 80, 100);
+        const cv::Rect restored = geometry.sourceRect(
+            geometry.left + expected.x * geometry.scale,
+            geometry.top + expected.y * geometry.scale,
+            geometry.left + (expected.x + expected.width) * geometry.scale,
+            geometry.top + (expected.y + expected.height) * geometry.scale);
+        QCOMPARE(restored, expected);
+        QCOMPARE(geometry.sourceRect(-20, -20, 660, 660), cv::Rect(0, 0, sourceSize.width, sourceSize.height));
+        if (geometry.top) QVERIFY(geometry.sourceRect(0, 0, 80, geometry.top - 1).empty());
+    }
+    const YoloInputGeometry video(cv::Size(1280, 720));
+    QCOMPARE(video.resizedSize, cv::Size(640, 360));
+    QCOMPARE(video.top, 140);
+    // A camera target 80px below center must still give +80px after inference.
+    const cv::Rect restored = video.sourceRect(300, 340, 340, 380);
+    QCOMPARE(restored.y + restored.height / 2 - 360, 80);
+}
 
 void TrackingConcurrencyTest::rtspFramePublicationIsIsolatedAcrossSessions()
 {
@@ -382,6 +478,88 @@ void TrackingConcurrencyTest::engineHoldAndStaleDnnSessionGiveNoOffset()
     QVERIFY(!engine.m_isTargetTracked);
 }
 
+void TrackingConcurrencyTest::yoloResultsReachControlWithoutAnotherVideoFrame()
+{
+    MainWindow window(nullptr, false);
+    QUdpSocket server;
+    QVERIFY(server.bind(QHostAddress(QHostAddress::LocalHost), quint16(0)));
+    QList<QJsonObject> tracks;
+    int statusSequence = 0;
+    connect(&server, &QUdpSocket::readyRead, &window, [&] {
+        while (server.hasPendingDatagrams()) {
+            const auto packet = server.receiveDatagram();
+            const auto request = QJsonDocument::fromJson(packet.data()).object();
+            auto reply = [&](QJsonObject body) {
+                body.insert("version", 1); body.insert("session", request.value("session"));
+                server.writeDatagram(QJsonDocument(body).toJson(QJsonDocument::Compact),
+                                     packet.senderAddress(), packet.senderPort());
+            };
+            const auto type = request.value("type").toString();
+            if (type == "hello") reply({{"type", "welcome"}});
+            if (type == "hello" || type == "heartbeat")
+                reply({{"type", "status"}, {"seq", ++statusSequence}, {"online", true},
+                       {"mode", 1}, {"horizontal", 40}, {"vertical", 200}});
+            if (type == "track") tracks.append(request);
+        }
+    });
+    window.m_networkController.setAuthKey({});
+    window.m_networkController.connectToDevice(QStringLiteral("127.0.0.1"), server.localPort());
+    QTRY_VERIFY(window.m_networkController.isOpen());
+    window.m_isCapturing = true;
+    auto &engine = window.m_trackingEngine;
+    engine.setFrameSize(QSize(1280, 720));
+    engine.m_isCapturing = true;
+    engine.m_useFeatureTracking = false;
+    engine.m_dnnSessionId = 42;
+    window.m_lastControlSendTime = QDateTime::currentMSecsSinceEpoch();
+    engine.onDnnTrackedResult(cv::Rect2d(900, 500, 60, 60), true, QStringLiteral("LOCK:cup"), 42);
+    QTRY_COMPARE_WITH_TIMEOUT(tracks.size(), 1, 250);
+    QVERIFY(tracks.last().value("x").toInt() > 0);
+    engine.onDnnTrackedResult(cv::Rect2d(900, 500, 60, 60), true, QStringLiteral("HOLD"), 42);
+    QTRY_COMPARE_WITH_TIMEOUT(tracks.size(), 2, 250);
+    QCOMPARE(tracks.last().value("x").toInt(), 0);
+    QCOMPARE(tracks.last().value("y").toInt(), 0);
+    engine.onDnnTrackedResult(cv::Rect2d(100, 100, 60, 60), true, QStringLiteral("LOCK:cup"), 41);
+    QTest::qWait(30);
+    QCOMPARE(tracks.size(), 2);
+    window.stopLocalControl();
+}
+
+void TrackingConcurrencyTest::discoveryPrefersEthernetAndFallsBackToWifi()
+{
+    QSettings settings(QStringLiteral("LuckfoxTracker"), QStringLiteral("Camera"));
+    const auto oldAddress = settings.value("lastAddress");
+    const auto oldId = settings.value("deviceId");
+    const auto restore = qScopeGuard([&] {
+        if (oldAddress.isValid()) settings.setValue("lastAddress", oldAddress); else settings.remove("lastAddress");
+        if (oldId.isValid()) settings.setValue("deviceId", oldId); else settings.remove("deviceId");
+    });
+    QNetworkAddressEntry ethernet;
+    ethernet.setIp(QHostAddress("192.168.8.188")); ethernet.setPrefixLength(24);
+    LuckfoxDiscovery discovery;
+    discovery.m_ethernetAddresses = {ethernet};
+    discovery.m_elapsed.start(); discovery.m_active = true;
+    QSignalSpy found(&discovery, &LuckfoxDiscovery::found);
+    discovery.considerCandidate(QHostAddress("192.168.110.144"), "luckfox-test");
+    QCOMPARE(found.size(), 0);
+    discovery.considerCandidate(QHostAddress("192.168.8.93"), "luckfox-test");
+    QCOMPARE(found.size(), 1);
+    QCOMPARE(found.last().at(0).toString(), QStringLiteral("rtsp://192.168.8.93/live/0"));
+    QTest::qWait(180);
+    QCOMPARE(found.size(), 1);
+    discovery.m_active = true;
+    discovery.considerCandidate(QHostAddress("192.168.110.144"), "luckfox-test");
+    QTRY_COMPARE_WITH_TIMEOUT(found.size(), 2, 500);
+    QCOMPARE(found.last().at(0).toString(), QStringLiteral("rtsp://192.168.110.144/live/0"));
+    discovery.m_active = true;
+    discovery.considerCandidate(QHostAddress("192.168.110.144"), "luckfox-test");
+    discovery.cancel();
+    QTest::qWait(180);
+    QCOMPARE(found.size(), 2);
+    QVERIFY(!LuckfoxNetworkRoute::isOnEthernetSubnet(QHostAddress("192.168.8.188"), {ethernet}));
+    QVERIFY(!LuckfoxNetworkRoute::isOnEthernetSubnet(QHostAddress("192.168.110.144"), {ethernet}));
+}
+
 void TrackingConcurrencyTest::installedCameraTrackingDirections_data()
 {
     QTest::addColumn<bool>("featureTracking");
@@ -402,6 +580,10 @@ void TrackingConcurrencyTest::installedCameraTrackingDirections()
     QFETCH(QPoint, displayOffset);
     MainWindow window(nullptr, false);
     QCOMPARE(window.m_cameraManager.rotationMode(), CameraManager::RotationMode::MirrorV);
+    auto *model = window.findChild<QComboBox *>(QStringLiteral("comboBox_4"));
+    QVERIFY(model);
+    model->setCurrentIndex(model->findData(featureTracking ? QStringLiteral("feature")
+                                                          : QStringLiteral("yolo26s.onnx")));
     QUdpSocket server;
     QVERIFY(server.bind(QHostAddress(QHostAddress::LocalHost), quint16(0)));
     QList<QJsonObject> tracks;

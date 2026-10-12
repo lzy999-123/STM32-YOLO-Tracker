@@ -15,6 +15,9 @@ SOURCES += \
     dnnthread.cpp
 
 HEADERS += \
+    luckfoxnetworkroute.h \
+    yoloinputgeometry.h \
+    trackingdiagnostics.h \
     mainwindow.h \
     luckfoxdiscovery.h \
     networkcontroller.h \

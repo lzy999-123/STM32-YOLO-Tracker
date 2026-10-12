@@ -1,4 +1,6 @@
 #include "cameramanager.h"
+#include "luckfoxnetworkroute.h"
+#include <QUrl>
 #include <QMediaDevices>
 #include <QCameraDevice>
 #include <QCameraFormat>
@@ -217,8 +219,13 @@ void CameraManager::rtspWorkerLoop(const QString &url, quint64 sessionId,
         if (sessionId != m_rtspSessionId.load() || !m_rtspRunning.load()) return;
     }
     if (sessionId != m_rtspSessionId.load() || !m_rtspRunning.load()) return;
-    setFfmpegOptions(s_tcpOptions);
-    qDebug() << "[CameraManager] 开始 720P 低延迟取流 (TCP):" << url;
+    // The direct Ethernet baseline is smoother over RTP/UDP. Keep the existing
+    // TCP preference for other routes; do not infer Ethernet from a fixed IP.
+    const bool preferUdp = LuckfoxNetworkRoute::isOnEthernetSubnet(
+        QHostAddress(QUrl(url).host()), LuckfoxNetworkRoute::ethernetAddresses());
+    setFfmpegOptions(preferUdp ? s_udpOptions : s_tcpOptions);
+    qDebug() << "[CameraManager] 开始 720P 低延迟取流:"
+             << (preferUdp ? "UDP (Ethernet)" : "TCP") << url;
     cv::VideoCapture cap;
     const std::vector<int> openParams{
         cv::CAP_PROP_OPEN_TIMEOUT_MSEC, 5000,
@@ -227,9 +234,10 @@ void CameraManager::rtspWorkerLoop(const QString &url, quint64 sessionId,
     cap.open(url.toStdString(), cv::CAP_FFMPEG, openParams);
 
     if (!cap.isOpened() && m_rtspRunning.load() && sessionId == m_rtspSessionId.load()) {
-        qWarning() << "[CameraManager] TCP RTSP 打开失败，回退 UDP:" << url;
+        qWarning() << "[CameraManager] RTSP 打开失败，切换传输:"
+                   << (preferUdp ? "TCP" : "UDP") << url;
         cap.release();
-        setFfmpegOptions(s_udpOptions);
+        setFfmpegOptions(preferUdp ? s_tcpOptions : s_udpOptions);
         cap.open(url.toStdString(), cv::CAP_FFMPEG, openParams);
     }
     openLock.unlock();

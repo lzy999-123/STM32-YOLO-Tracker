@@ -144,6 +144,8 @@ private:
     std::vector<std::string> m_classNames;///< COCO 等数据集的类别名称列表
     cv::Rect2d m_lastYoloRect;            ///< 上一帧通过 YOLO 检测到的目标位置
 
+    qint64 m_frameSubmittedMs = 0;
+    qint64 m_initSubmittedMs = 0;
     cv::Mat m_frame;                      ///< 供追踪更新使用的当前帧
     cv::Mat m_initFrame;                  ///< 供初始化的图像帧
     cv::Mat m_detectFrame;                ///< 供全图检测使用的图像帧

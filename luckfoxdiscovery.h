@@ -7,10 +7,14 @@
 #include <QList>
 #include <QHostAddress>
 #include <QElapsedTimer>
+#include <QNetworkAddressEntry>
 
 class LuckfoxDiscovery : public QObject
 {
     Q_OBJECT
+#ifdef TRACKING_CONCURRENCY_TEST
+    friend class TrackingConcurrencyTest;
+#endif
 public:
     explicit LuckfoxDiscovery(QObject *parent = nullptr);
     void start();
@@ -34,12 +38,18 @@ signals:
 private:
     void probe();
     void receive();
+    void acceptCandidate();
+    void considerCandidate(const QHostAddress &address, const QString &id);
     QUdpSocket m_socket;
     QTimer m_retry;
     QTimer m_deadline;
+    QTimer m_candidateWait;
     QElapsedTimer m_elapsed;
     QList<QHostAddress> m_broadcasts;
     QList<quint32> m_subnets;
+    QList<QNetworkAddressEntry> m_ethernetAddresses;
+    QString m_candidateAddress;
+    QString m_candidateId;
     QString m_nonce;
     QString m_deviceId;
     QHostAddress m_cachedAddress;

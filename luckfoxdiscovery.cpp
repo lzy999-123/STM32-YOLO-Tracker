@@ -1,5 +1,6 @@
 #include "luckfoxdiscovery.h"
 #include "networkcontroller.h"
+#include "luckfoxnetworkroute.h"
 
 #include <QJsonDocument>
 #include <QJsonObject>
@@ -18,6 +19,9 @@ LuckfoxDiscovery::LuckfoxDiscovery(QObject *parent) : QObject(parent)
 {
     m_retry.setInterval(250);
     m_deadline.setSingleShot(true);
+    m_candidateWait.setSingleShot(true);
+    m_candidateWait.setInterval(150);
+    connect(&m_candidateWait, &QTimer::timeout, this, &LuckfoxDiscovery::acceptCandidate);
     connect(&m_socket, &QUdpSocket::readyRead, this, &LuckfoxDiscovery::receive);
     connect(&m_retry, &QTimer::timeout, this, &LuckfoxDiscovery::probe);
     connect(&m_deadline, &QTimer::timeout, this, [this] {
@@ -79,15 +83,11 @@ void LuckfoxDiscovery::start()
     m_deviceId = settings.value(QStringLiteral("deviceId")).toString();
     m_broadcasts.clear();
     m_subnets.clear();
+    m_ethernetAddresses = LuckfoxNetworkRoute::ethernetAddresses();
     const auto interfaces = QNetworkInterface::allInterfaces();
-    bool hasWifi = false;
     for (const auto &interface : interfaces) {
-        if (interface.type() == QNetworkInterface::Wifi &&
-            interface.flags().testFlag(QNetworkInterface::IsUp) &&
-            interface.flags().testFlag(QNetworkInterface::IsRunning)) hasWifi = true;
-    }
-    for (const auto &interface : interfaces) {
-        if (hasWifi && interface.type() != QNetworkInterface::Wifi) continue;
+        if (interface.type() != QNetworkInterface::Wifi &&
+            interface.type() != QNetworkInterface::Ethernet) continue;
         const auto flags = interface.flags();
         if (!flags.testFlag(QNetworkInterface::IsUp) ||
             !flags.testFlag(QNetworkInterface::IsRunning) ||
@@ -149,16 +149,38 @@ void LuckfoxDiscovery::receive()
             m_roundOtherId = id; // 不自动切换，只在本轮超时时报告
             continue;
         }
-        m_missingRounds = 0;
-        const QString address = datagram.senderAddress().toString();
-        QSettings settings(QStringLiteral("LuckfoxTracker"), QStringLiteral("Camera"));
-        settings.setValue(QStringLiteral("lastAddress"), address);
-        settings.setValue(QStringLiteral("deviceId"), id);
-        qDebug() << "[Discovery] found_ms=" << m_elapsed.elapsed();
-        cancel();
-        emit found(QStringLiteral("rtsp://%1/live/0").arg(address));
+        considerCandidate(datagram.senderAddress(), id);
+        if (!m_active) return;
+    }
+}
+
+void LuckfoxDiscovery::considerCandidate(const QHostAddress &sender, const QString &id)
+{
+    const QString address = sender.toString();
+    const bool wired = LuckfoxNetworkRoute::isOnEthernetSubnet(sender, m_ethernetAddresses);
+    if (m_candidateAddress.isEmpty() || wired) {
+        m_candidateAddress = address;
+        m_candidateId = id;
+    }
+    if (wired || m_ethernetAddresses.isEmpty()) {
+        acceptCandidate();
         return;
     }
+    // Give a simultaneous Ethernet response a short chance to win over Wi-Fi.
+    if (!m_candidateWait.isActive()) m_candidateWait.start();
+}
+
+void LuckfoxDiscovery::acceptCandidate()
+{
+    if (!m_active || m_candidateAddress.isEmpty()) return;
+    const QString address = m_candidateAddress;
+    QSettings settings(QStringLiteral("LuckfoxTracker"), QStringLiteral("Camera"));
+    settings.setValue(QStringLiteral("lastAddress"), address);
+    settings.setValue(QStringLiteral("deviceId"), m_candidateId);
+    m_missingRounds = 0;
+    qDebug() << "[Discovery] found_ms=" << m_elapsed.elapsed();
+    cancel();
+    emit found(QStringLiteral("rtsp://%1/live/0").arg(address));
 }
 
 void LuckfoxDiscovery::cancel()
@@ -166,5 +188,8 @@ void LuckfoxDiscovery::cancel()
     m_active = false;
     m_retry.stop();
     m_deadline.stop();
+    m_candidateWait.stop();
+    m_candidateAddress.clear();
+    m_candidateId.clear();
     m_socket.close();
 }

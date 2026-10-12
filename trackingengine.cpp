@@ -1,4 +1,5 @@
 #include "trackingengine.h"
+#include "trackingdiagnostics.h"
 #include <QDateTime>
 #include <QDebug>
 #include <QtGlobal>
@@ -145,8 +146,15 @@ void TrackingEngine::onDnnTrackedResult(
     std::lock_guard<std::recursive_mutex> stateLock(m_stateMutex);
     // DnnThread 解锁后才发信号，期间可能已经 stop/start 了新会话；
     // 这里在状态锁内再按会话 ID 校验，旧会话的 LOCK/跟踪结果一律丢弃。
-    if (sessionId == 0 || sessionId != m_dnnSessionId || m_useFeatureTracking) return;
+    if (!m_isCapturing || sessionId == 0 || sessionId != m_dnnSessionId || m_useFeatureTracking) return;
     onDnnResultReceived(dnnRect, success, className);
+    // Deliver a fresh result as soon as inference ends, even if the next video
+    // frame is delayed. HOLD and tolerated misses deliver zero offsets.
+    const quint64 generation = m_trackingGeneration.load(std::memory_order_acquire);
+    if (m_isTargetTracked && !m_trackedRect.empty())
+        emit targetTracked(m_trackedRect, m_offsetX, m_offsetY, generation, m_resultSeq);
+    else
+        emit targetLost(generation);
 }
 
 void TrackingEngine::onDnnResultReceived(const cv::Rect2d &dnnRect, bool success, const QString &className) {
@@ -188,12 +196,18 @@ void TrackingEngine::onDnnResultReceived(const cv::Rect2d &dnnRect, bool success
     const int DEAD_ZONE = 18;
     const bool isFeatureResult = (resultName == QStringLiteral("FEATURE"));
     bool currentSuccess = (success && isReasonable);
+    if (trackingDiagnosticsEnabled())
+        qInfo("[TrackTrace] kind=engine t=%lld result=%llu success=%d reasonable=%d w=%.2f h=%.2f",
+              trackingClockMs(), m_resultSeq, int(success), int(isReasonable), dnnRect.width, dnnRect.height);
 
     if (currentSuccess) {
         m_isTargetTracked = true;
         m_lostFrameCount = 0; // 目标找回，清零
 
-        if (m_trackedRect.empty() || isRecoverResult) {
+        // DnnThread already filters YOLO's center and size together. Filtering
+        // size again while snapping x/y moves the center of a stationary target
+        // whenever its detected width/height changes, creating false commands.
+        if (!isFeatureResult || m_trackedRect.empty() || isRecoverResult) {
             m_trackedRect = dnnRect;
         } else {
             const double oldCenterX = m_trackedRect.x + m_trackedRect.width * 0.5;

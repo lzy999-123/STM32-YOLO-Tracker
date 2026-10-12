@@ -1,4 +1,6 @@
 #include "dnnthread.h"
+#include "yoloinputgeometry.h"
+#include "trackingdiagnostics.h"
 #include <QCoreApplication>
 #include <QDebug>
 #include <QDir>
@@ -308,6 +310,7 @@ void DnnThread::updateDnn(const cv::Mat &frame) {
     QMutexLocker locker(&m_mutex);
     if (!m_isTracking || frame.empty()) return;
     m_frame = frame;
+    m_frameSubmittedMs = trackingClockMs();
     m_hasNewFrame = true;
     m_workAvailable.wakeOne();
 }
@@ -325,6 +328,7 @@ quint64 DnnThread::initDnn(const cv::Mat &frame, const cv::Rect2d &target) {
     m_dnnMissCount = 0;
     m_lastYoloRect = cv::Rect2d();
     m_initFrame = frame;
+    m_initSubmittedMs = trackingClockMs();
     m_initRect = target;
     m_needInit = true;
     m_isTracking = true;
@@ -432,6 +436,7 @@ void DnnThread::run() {
         bool doDetection = false;
         quint64 detectionRequestId = 0;
         quint64 workSession = 0;
+        qint64 submittedMs = 0;
         cv::Rect2d initR;
 
         {
@@ -459,12 +464,14 @@ void DnnThread::run() {
                 initR = m_initRect;
                 m_needInit = false;
                 processFrame = m_initFrame;
+                submittedMs = m_initSubmittedMs;
                 m_initFrame.release();
                 m_isComputing = true;
             } else if (m_hasNewFrame) {
                 doUpdate = true;
                 m_hasNewFrame = false;
                 processFrame = m_frame;
+                submittedMs = m_frameSubmittedMs;
                 m_frame.release();
                 m_isComputing = true;
             }
@@ -477,8 +484,10 @@ void DnnThread::run() {
         }
 
         // ------------------ ONNX Runtime 前向推理 ------------------
+        const YoloInputGeometry inputGeometry(processFrame.size());
+        const cv::Mat modelImage = inputGeometry.prepare(processFrame);
         cv::Mat blob;
-        cv::dnn::blobFromImage(processFrame, blob, 1.0 / 255.0, cv::Size(640, 640), cv::Scalar(), true, false);
+        cv::dnn::blobFromImage(modelImage, blob, 1.0 / 255.0, cv::Size(640, 640), cv::Scalar(), true, false);
         
         const std::array<int64_t, 4> input_dims = {1, 3, 640, 640};
         auto memory_info = Ort::MemoryInfo::CreateCpu(OrtDeviceAllocator, OrtMemTypeCPU);
@@ -543,8 +552,6 @@ void DnnThread::run() {
 
         float* output_data = output_tensors[0].GetTensorMutableData<float>();
         cv::Mat output2d(outputRows, outputCols, CV_32F, output_data);
-        const float x_factor = processFrame.cols / 640.0f;
-        const float y_factor = processFrame.rows / 640.0f;
         std::vector<int> classIds;
         std::vector<float> confidences;
         std::vector<cv::Rect> boxes;
@@ -596,16 +603,13 @@ void DnnThread::run() {
                 bottom = cy + 0.5f * h;
             }
 
-            const int x = static_cast<int>(left * x_factor);
-            const int y = static_cast<int>(top * y_factor);
-            const int width = static_cast<int>((right - left) * x_factor);
-            const int height = static_cast<int>((bottom - top) * y_factor);
-            if (width <= 1 || height <= 1) {
+            const cv::Rect box = inputGeometry.sourceRect(left, top, right, bottom);
+            if (box.width <= 1 || box.height <= 1) {
                 return;
             }
             classIds.push_back(classId);
             confidences.push_back(confidence);
-            boxes.push_back(cv::Rect(x, y, width, height));
+            boxes.push_back(box);
         };
 
         if (output2d.cols == 6 || output2d.rows == 6) {
@@ -696,16 +700,14 @@ void DnnThread::run() {
                         !std::isfinite(w) || !std::isfinite(h)) {
                         continue;
                     }
-                    int left = int((cx - 0.5 * w) * x_factor);
-                    int top = int((cy - 0.5 * h) * y_factor);
-                    int width = int(w * x_factor);
-                    int height = int(h * y_factor);
-                    if (width <= 1 || height <= 1) continue;
+                    const cv::Rect box = inputGeometry.sourceRect(
+                        cx - 0.5 * w, cy - 0.5 * h, cx + 0.5 * w, cy + 0.5 * h);
+                    if (box.width <= 1 || box.height <= 1) continue;
 
                     for (int candidateIndex = 0; candidateIndex < candidateCount; ++candidateIndex) {
                         classIds.push_back(candidateClassIds[candidateIndex]);
                         confidences.push_back(candidateScores[candidateIndex]);
-                        boxes.push_back(cv::Rect(left, top, width, height));
+                        boxes.push_back(box);
                     }
                 }
             }
@@ -833,6 +835,9 @@ void DnnThread::run() {
             // 的 state -> input 顺序相反。成功与失败结果都必须在解锁后发出。
             // 解锁后仍可能被新会话抢先；引擎侧会再用 sessionId 校验一次。
             if (sessionCurrent) {
+                if (trackingDiagnosticsEnabled())
+                    qInfo("[TrackTrace] kind=lock t=%lld input=%lld session=%llu success=%d candidates=%d",
+                          trackingClockMs(), submittedMs, workSession, int(success), int(indices.size()));
                 emit dnnTrackedResult(resultRect, success, resultName, workSession);
             }
         } else if (doUpdate) {
@@ -942,6 +947,15 @@ void DnnThread::run() {
 
                         QString cName = yoloClassName(lockedClass, m_classNames);
                         if (sessionCurrent) {
+                            if (trackingDiagnosticsEnabled())
+                                qInfo("[TrackTrace] kind=dnn t=%lld input=%lld session=%llu rawX=%.2f rawY=%.2f x=%.2f y=%.2f w=%.2f h=%.2f confidence=%.4f recover=%d",
+                                      trackingClockMs(), submittedMs, workSession,
+                                      detectedRect.x + detectedRect.width * 0.5,
+                                      detectedRect.y + detectedRect.height * 0.5,
+                                      outputRect.x + outputRect.width * 0.5,
+                                      outputRect.y + outputRect.height * 0.5,
+                                      outputRect.width, outputRect.height,
+                                      double(confidences[best_idx]), int(recoveredAfterMiss));
                             emit dnnTrackedResult(
                                 outputRect,
                                 true,
@@ -967,6 +981,10 @@ void DnnThread::run() {
                             }
                         }
                         // HOLD 只表示“短暂未检出、沿用上一位置用于显示”，不是新的测量；
+                        if (sessionCurrent && trackingDiagnosticsEnabled())
+                            qInfo("[TrackTrace] kind=miss t=%lld input=%lld session=%llu count=%d candidates=%d nearest=%.2f gate=%.2f hold=%d",
+                                  trackingClockMs(), submittedMs, workSession, missCount,
+                                  int(indices.size()), min_dist, maxTrackingDistance, int(canHold));
                         // 引擎在 HOLD 期间输出零偏移，避免下位机按旧误差持续转动。
                         if (!sessionCurrent) {
                             // 旧会话结果直接丢弃

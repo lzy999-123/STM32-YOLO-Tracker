@@ -1,5 +1,27 @@
 # 720p30 视频链路与连续性验收
 
+## 2026-10-12 有线连接与 YOLO 结果交付
+
+自动识别同时探测活动网口和 Wi-Fi。同一已记住设备同时回应时优先采用网口；只有无线回应时短暂等待 150ms 后采用无线。RTSP 目标处于本机活动 Ethernet 子网时，优先使用 UDP，建联失败回退 TCP；其他路径继续 TCP 优先。通过实际接口与子网判断，不写死设备 IP。USB/RNDIS 若被 Windows 归类为 Ethernet，也采用该策略，但本轮实测对象仅为直接网线。
+
+YOLO 推理结束立即交付新结果，保持会话隔离、相同结果序号去重和 HOLD/未检出零偏移。20ms 发送限流通过精确定时器补发最新结果，避免等待下一张视频帧。时间叠加仍只在显示层绘制。
+
+YOLO输入采用保持比例的640×640 letterbox（114补边），输出还原原图坐标。跟踪引擎直接采用DnnThread已平滑的完整框，避免再次平滑宽高而制造中心漂移。已通过公开bus.jpg与官方Ultralytics的真实模型对照及中心固定/尺寸变化回归。需要定位跟随时可在启动前设`QT_TRACK_CONTROL_TRACE=1`，日志只记录坐标、置信度、时间和遥测，不保存摄像头画面；未设置时关闭。局部检测与加速试验现场退步已撤回；最终恢复版本39项Qt通过，用户在手机静止和小幅左右移动复测后反馈“现在就很好”，正式EXE保留该版。未修改或烧录STM32固件；更大动作、不同朝向和长期连续性仍需独立验证。
+
+
+实测对照中 TCP 有短时集中到达；有线 UDP 的 60 秒视频及 90 秒 YOLO26s 实流负载均为每秒 30–31 次不同画面绘制，90 秒最大绘制间隔 43.35ms、推理结果间隔 47.16ms。数据仅证明该次窗口绘制与推理节奏，未证明电机跟随或相机到屏幕延迟。
+
+最终自动发现独立 120 秒 YOLO26s 测量：逐秒均 30 帧，最大绘制间隔 58.70ms（1次大于50ms），最大推理结果间隔 64.71ms；没有重连或摄像头错误。另一次存在并发主机工作时出现 107.80ms 绘制间隔，该失败记录保留。不能由逐秒计数宣称长期零抖动，详情见 [本次报告](../learning/2026-10-12-01-wired-video-cadence-and-yolo-dispatch.md)。
+
+探针现在使用正常 Qt 事件循环测量，避免 qWait 轮询睡眠合并重绘。支持 `--auto-discover`，`--yolo-benchmark` 使用实时视频和正式推理代码并断开控制，保存时间与状态元数据，不保存图像。例：
+
+```text
+video_cadence_probe --auto-discover --seconds 120 --yolo-benchmark --output <忽略目录>/video.json
+python tools/analyze_video_cadence.py <忽略目录>/video.json --output <忽略目录>/analysis.json
+```
+
+OpenCV 通路仍不提供源 PTS；分析器不会据此宣布源时间戳连续性验收完成。逐秒绘制统计和最长空档需分别报告。旧章节中的固定 TCP 优先说明对应历史版本。
+
 ## 2026-10-11 项目清理
 
 当前视频仍使用下文的 OpenCV/TCP 优先链路。未接入正式构建的 `rtspdecoder.*`、`rtspstreamhealth.h`、`videoplayout.h` 及其专用单元测试已从工作树移除，需要研究时可从阶段提交 `38f1365135b4f073a19bd16bd4984a2d53f57265` 恢复。`tests/video_cadence_probe.*`、`tools/analyze_video_cadence.py` 及分析器回归测试仍用于当前正式链路，继续保留。后面的原生 FFmpeg 实验内容是历史记录；清理范围见 [项目清理报告](../learning/2026-10-11-09-project-cleanup.md)。

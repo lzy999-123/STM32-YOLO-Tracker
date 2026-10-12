@@ -114,6 +114,7 @@ private:
     QString m_deviceUrl;
     bool m_openVideoAfterDiscovery = false;
     QTimer m_deviceReconnectTimer;
+    QTimer m_trackFlushTimer;
     bool m_modeSwitchPending = false;
     QList<QPair<QWidget *, QRect>> m_baseGeometries;
     

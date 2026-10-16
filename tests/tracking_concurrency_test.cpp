@@ -54,6 +54,9 @@ private slots:
     void rtspFramePublicationIsIsolatedAcrossSessions();
     void rtspLatestFrameCoalescesBursts();
     void rtspWatchdogUsesHistoricalTimeout();
+    void researchFrameFollowsCoalescedInput();
+    void researchDnnPendingFrameKeepsIdentity();
+    void researchRealInferenceCarriesFrame();
 
 };
 
@@ -186,6 +189,69 @@ void TrackingConcurrencyTest::rtspLatestFrameCoalescesBursts()
     QCOMPARE(frames.count(), 2);
     QCOMPARE(qvariant_cast<cv::Mat>(frames.at(1).at(0)).at<cv::Vec3b>(0, 0)[0], uchar(33));
     camera.closeCamera();
+}
+
+void TrackingConcurrencyTest::researchFrameFollowsCoalescedInput()
+{
+    if (!ResearchTrace::enabled()) QSKIP("Set QT_RESEARCH_LOG_DIR to exercise metadata");
+    CameraManager camera;
+    camera.m_cameraState = CameraManager::CameraState::Open;
+    camera.m_rtspRunning = true;
+    const auto session = camera.m_rtspSessionId.load();
+    camera.publishRtspFrame(cv::Mat(2,2,CV_8UC3,cv::Scalar(1,1,1)),session,100,3);
+    const auto first = camera.m_latestResearchFrame.id;
+    camera.publishRtspFrame(cv::Mat(2,2,CV_8UC3,cv::Scalar(2,2,2)),session,200,1);
+    camera.notifyNewMat(session);
+    const auto delivered = camera.deliveredResearchFrame();
+    QCOMPARE(delivered.id, first + 1);
+    QCOMPARE(delivered.hostReceiveUs, 200);
+    QCOMPARE(delivered.rotation, 1);
+    camera.stopRtspStream();
+    camera.m_rtspRunning = true;
+    camera.publishRtspFrame(cv::Mat(2,2,CV_8UC3),session,300,0);
+    QVERIFY(camera.m_latestRtspMat.empty());
+    camera.closeCamera();
+}
+
+void TrackingConcurrencyTest::researchDnnPendingFrameKeepsIdentity()
+{
+    DnnThread dnn("nonexistent-test-model.onnx"); // Does not start model loading.
+    dnn.m_isTracking = true;
+    const cv::Mat frame(2,2,CV_8UC3,cv::Scalar(0,0,0));
+    dnn.updateDnn(frame, ResearchFrame{4,2,100,-1,3});
+    dnn.updateDnn(frame, ResearchFrame{9,2,200,-1,3});
+    QCOMPARE(dnn.m_researchFrame.id, quint64(9));
+    QCOMPARE(dnn.m_researchFrame.hostReceiveUs, 200);
+    dnn.stopDnn();
+    QVERIFY(!dnn.m_hasNewFrame);
+}
+
+void TrackingConcurrencyTest::researchRealInferenceCarriesFrame()
+{
+    if (!ResearchTrace::enabled()) QSKIP("Set QT_RESEARCH_LOG_DIR for inference trace test");
+    const QString root = qEnvironmentVariable("QT_RESEARCH_TEST_ROOT");
+    if (root.isEmpty()) QSKIP("Set QT_RESEARCH_TEST_ROOT for local public image and model");
+    const cv::Mat frame = cv::imread((root + "/tools/bus.jpg").toStdString());
+    QVERIFY(!frame.empty());
+    DnnThread dnn(root + "/yolo26s.onnx");
+    QSignalSpy results(&dnn, &DnnThread::dnnTrackedResult);
+    dnn.start();
+    auto cleanup = qScopeGuard([&] { dnn.requestInterruption(); dnn.stopDnn(); dnn.wait(); });
+    QTRY_VERIFY_WITH_TIMEOUT(dnn.isWarmedUp() || dnn.isLoadFailed(), 60000);
+    QVERIFY(dnn.isWarmedUp());
+    dnn.initDnn(frame, cv::Rect2d(6,230,797,512));
+    QTRY_VERIFY_WITH_TIMEOUT(!results.empty(), 10000);
+    QVERIFY(results.last().at(1).toBool());
+    const int before = results.count();
+    const ResearchFrame stamp{1001,9001,ResearchTrace::nowUs(),-1,0};
+    auto fields = stamp.json();
+    fields.insert("width",frame.cols); fields.insert("height",frame.rows);
+    fields.insert("source","public_image_test_not_camera");
+    ResearchTrace::record("frame",fields);
+    dnn.updateDnn(frame,stamp);
+    QTRY_VERIFY_WITH_TIMEOUT(results.count() > before, 10000);
+    QVERIFY(results.last().at(1).toBool());
+    QVERIFY(results.last().at(2).toString() != "HOLD");
 }
 
 void TrackingConcurrencyTest::rtspWatchdogUsesHistoricalTimeout()

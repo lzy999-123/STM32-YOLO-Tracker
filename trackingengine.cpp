@@ -1649,7 +1649,7 @@ void TrackingEngine::stopTracking() {
     emit targetLost(generation);
 }
 
-void TrackingEngine::processFrame(const cv::Mat &frame) {
+void TrackingEngine::processFrame(const cv::Mat &frame, const ResearchFrame &stamp) {
     std::lock_guard<std::recursive_mutex> stateLock(m_stateMutex);
     if (!m_isCapturing) return;
     const quint64 generation = m_trackingGeneration.load(std::memory_order_acquire);
@@ -1700,7 +1700,7 @@ void TrackingEngine::processFrame(const cv::Mat &frame) {
         // YOLO logic is handled by dnnThread async, it calls onDnnResultReceived
         // But we might need to send frames to it
         if (m_dnnThread && m_dnnThread->isWarmedUp()) {
-            m_dnnThread->updateDnn(frame);
+            m_dnnThread->updateDnn(frame, stamp);
         }
         // 每个视频帧都会发信号用于界面显示；resultSeq 只在 DNN 返回新结果时变化，
         // 接收方据此只下发新结果，不会对同一结果按视频帧重复发送。

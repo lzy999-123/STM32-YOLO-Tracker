@@ -8,6 +8,7 @@
 #include <opencv2/dnn.hpp>
 #include <opencv2/opencv.hpp>
 #include <onnxruntime_cxx_api.h>
+#include "researchframe.h"
 
 /**
  * @brief DNN 推理线程类
@@ -44,7 +45,7 @@ public:
      * @brief 传递新的一帧给 DNN 线程进行处理
      * @param frame 新的图像帧
      */
-    void updateDnn(const cv::Mat &frame);
+    void updateDnn(const cv::Mat &frame, const ResearchFrame &stamp = {});
     
     /**
      * @brief 请求全图目标检测
@@ -145,6 +146,7 @@ private:
     cv::Rect2d m_lastYoloRect;            ///< 上一帧通过 YOLO 检测到的目标位置
 
     qint64 m_frameSubmittedMs = 0;
+    ResearchFrame m_researchFrame;
     qint64 m_initSubmittedMs = 0;
     cv::Mat m_frame;                      ///< 供追踪更新使用的当前帧
     cv::Mat m_initFrame;                  ///< 供初始化的图像帧

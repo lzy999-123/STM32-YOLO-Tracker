@@ -1,4 +1,5 @@
 #include "networkcontroller.h"
+#include "researchtrace.h"
 #include <QCoreApplication>
 #include <QCryptographicHash>
 #include <QDir>
@@ -157,6 +158,7 @@ void NetworkController::connectToDevice(const QString &address, quint16 port)
     }
     configureTrafficPriority();
     m_session = QUuid::createUuid().toString(QUuid::WithoutBraces);
+    ++m_researchConnection;
     m_sequence = 0;
     m_lastTelemetrySequence = 0;
     m_lastReply = m_clock.elapsed();
@@ -298,6 +300,7 @@ void NetworkController::receive()
 {
     while (m_socket.hasPendingDatagrams()) {
         const auto packet = m_socket.receiveDatagram(1400);
+        const qint64 receivedUs = ResearchTrace::enabled() ? ResearchTrace::nowUs() : -1;
         if (!m_active || packet.senderAddress() != m_address || packet.senderPort() != m_port) continue;
         QByteArray inner;
         if (!openMessage(packet.data(), m_authKey, &inner)) continue; // 有密钥时丢弃未签名/伪造数据
@@ -345,6 +348,12 @@ void NetworkController::receive()
                 emit calibrationReceived(valid, valid ? float(h) : 0.0f, valid ? float(v) : 0.0f,
                                          valid ? float(hMin) : 0.0f, valid ? float(hMax) : 0.0f,
                                          valid ? float(vMin) : 0.0f, valid ? float(vMax) : 0.0f);
+                if (ResearchTrace::enabled())
+                    ResearchTrace::record("telemetry", {{"telemetry_seq", qint64(seq)},
+                        {"connection_id", qint64(m_researchConnection)}, {"host_receive_us", receivedUs},
+                        {"mode", mode}, {"horizontal_deg", horizontal}, {"vertical_deg", vertical},
+                        {"flags", m_flags}, {"calibration_valid", valid},
+                        {"encoder_sample_us", QJsonValue::Null}, {"source", "accepted_host_status"}});
                 emit telemetryReceived(mode, float(horizontal), float(vertical));
             } else {
                 m_remoteOnline = false;

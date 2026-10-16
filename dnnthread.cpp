@@ -182,11 +182,13 @@ bool DnnThread::loadModel()
         Ort::SessionOptions sessionOptions;
         sessionOptions.SetIntraOpNumThreads(4); // 将线程数由 1 改为 4，大幅提升 CPU 模式下的 FPS
         sessionOptions.SetGraphOptimizationLevel(GraphOptimizationLevel::ORT_ENABLE_ALL);
+        bool cudaConfigured = false;
 
         try {
             OrtCUDAProviderOptions cuda_options;
             cuda_options.device_id = 0;
             sessionOptions.AppendExecutionProvider_CUDA(cuda_options);
+            cudaConfigured = true;
             qDebug() << "成功配置 ONNX Runtime CUDA 执行器!";
         } catch (...) {
             qDebug() << "配置 CUDA 失败，将回退到 CPU!";
@@ -240,6 +242,16 @@ bool DnnThread::loadModel()
         qDebug() << "正在加载 YOLO 模型:" << modelPath;
         m_ortSession = new Ort::Session(
             m_ortEnv, modelPath.toStdWString().c_str(), sessionOptions);
+        if (ResearchTrace::enabled()) {
+            QFile modelFile(modelPath);
+            QCryptographicHash hash(QCryptographicHash::Sha256);
+            const bool hashed = modelFile.open(QIODevice::ReadOnly) && hash.addData(&modelFile);
+            ResearchTrace::record("model_loaded", {{"model", QFileInfo(modelPath).fileName()},
+                {"model_sha256", hashed ? QJsonValue(QString::fromLatin1(hash.result().toHex())) : QJsonValue(QJsonValue::Null)},
+                {"runtime", "onnxruntime"}, {"runtime_version", QString::fromLatin1(OrtGetApiBase()->GetVersionString())},
+                {"provider_configuration", cudaConfigured ? "CUDA_with_CPU_fallback" : "CPU"},
+                {"per_node_provider_verified", false}});
+        }
 
         Ort::AllocatorWithDefaultOptions allocator;
         m_inputNodeNamesStr.clear();
@@ -306,10 +318,11 @@ void DnnThread::requestDetections(const cv::Mat &frame, quint64 requestId) {
     m_workAvailable.wakeOne();
 }
 
-void DnnThread::updateDnn(const cv::Mat &frame) {
+void DnnThread::updateDnn(const cv::Mat &frame, const ResearchFrame &stamp) {
     QMutexLocker locker(&m_mutex);
     if (!m_isTracking || frame.empty()) return;
     m_frame = frame;
+    m_researchFrame = stamp;
     m_frameSubmittedMs = trackingClockMs();
     m_hasNewFrame = true;
     m_workAvailable.wakeOne();
@@ -437,6 +450,7 @@ void DnnThread::run() {
         quint64 detectionRequestId = 0;
         quint64 workSession = 0;
         qint64 submittedMs = 0;
+        ResearchFrame researchFrame;
         cv::Rect2d initR;
 
         {
@@ -472,6 +486,7 @@ void DnnThread::run() {
                 m_hasNewFrame = false;
                 processFrame = m_frame;
                 submittedMs = m_frameSubmittedMs;
+                researchFrame = m_researchFrame;
                 m_frame.release();
                 m_isComputing = true;
             }
@@ -484,6 +499,26 @@ void DnnThread::run() {
         }
 
         // ------------------ ONNX Runtime 前向推理 ------------------
+        const qint64 inferenceStartedUs = ResearchTrace::enabled() ? ResearchTrace::nowUs() : -1;
+        auto recordObservation = [&](const QString &outcome, const cv::Rect2d &raw,
+                                     double confidence, bool current, int classId = -1) {
+            if (!ResearchTrace::enabled()) return;
+            auto fields = researchFrame.json();
+            fields.insert("dnn_session", qint64(workSession));
+            fields.insert("submitted_host_ms", submittedMs);
+            fields.insert("inference_start_us", inferenceStartedUs);
+            fields.insert("inference_done_us", ResearchTrace::nowUs());
+            fields.insert("outcome", outcome);
+            fields.insert("session_current_at_completion", current);
+            fields.insert("model", QFileInfo(m_modelFileName).fileName());
+            fields.insert("class_id", classId >= 0 ? QJsonValue(classId) : QJsonValue(QJsonValue::Null));
+            fields.insert("width", processFrame.cols); fields.insert("height", processFrame.rows);
+            fields.insert("raw_x", raw.x); fields.insert("raw_y", raw.y);
+            fields.insert("raw_w", raw.width); fields.insert("raw_h", raw.height);
+            fields.insert("confidence", confidence >= 0 ? QJsonValue(confidence) : QJsonValue(QJsonValue::Null));
+            fields.insert("fresh_measurement", current && outcome == "detected");
+            ResearchTrace::record(doInit ? "inference_initialization" : "observation", fields);
+        };
         const YoloInputGeometry inputGeometry(processFrame.size());
         const cv::Mat modelImage = inputGeometry.prepare(processFrame);
         cv::Mat blob;
@@ -834,6 +869,7 @@ void DnnThread::run() {
             // 引擎回调会获取状态锁；持有输入锁发信号会与 processFrame/stopDnn
             // 的 state -> input 顺序相反。成功与失败结果都必须在解锁后发出。
             // 解锁后仍可能被新会话抢先；引擎侧会再用 sessionId 校验一次。
+            recordObservation(success ? "initial_lock" : "initial_miss", resultRect, -1, sessionCurrent);
             if (sessionCurrent) {
                 if (trackingDiagnosticsEnabled())
                     qInfo("[TrackTrace] kind=lock t=%lld input=%lld session=%llu success=%d candidates=%d",
@@ -858,6 +894,7 @@ void DnnThread::run() {
 
             if (currentlyTracking) {
                 if (!useYolo) {
+                    recordObservation("uninitialized", cv::Rect2d(), -1, true);
                     emit dnnTrackedResult(cv::Rect2d(), false, QString(), workSession);
                 } else {
                     // 正常跟踪时按上一位置找近邻；丢失后改为在画面中心附近重捕同类目标。
@@ -946,6 +983,7 @@ void DnnThread::run() {
                         }
 
                         QString cName = yoloClassName(lockedClass, m_classNames);
+                        recordObservation("detected", detectedRect, double(confidences[best_idx]), sessionCurrent, lockedClass);
                         if (sessionCurrent) {
                             if (trackingDiagnosticsEnabled())
                                 qInfo("[TrackTrace] kind=dnn t=%lld input=%lld session=%llu rawX=%.2f rawY=%.2f x=%.2f y=%.2f w=%.2f h=%.2f confidence=%.4f recover=%d",
@@ -981,6 +1019,7 @@ void DnnThread::run() {
                             }
                         }
                         // HOLD 只表示“短暂未检出、沿用上一位置用于显示”，不是新的测量；
+                        recordObservation(canHold ? "hold" : "miss", cv::Rect2d(), -1, sessionCurrent);
                         if (sessionCurrent && trackingDiagnosticsEnabled())
                             qInfo("[TrackTrace] kind=miss t=%lld input=%lld session=%llu count=%d candidates=%d nearest=%.2f gate=%.2f hold=%d",
                                   trackingClockMs(), submittedMs, workSession, missCount,

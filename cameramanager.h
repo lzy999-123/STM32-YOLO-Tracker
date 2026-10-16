@@ -16,6 +16,7 @@
 #include <mutex>
 #include <vector>
 #include <opencv2/core.hpp>
+#include "researchframe.h"
 
 Q_DECLARE_METATYPE(cv::Mat)
 
@@ -81,6 +82,8 @@ public:
     /// @brief 设置画面是否翻转 180 度（兼容旧接口）
     void setFlip180(bool flip);
     bool isFlip180() const;
+    // GUI-thread accessor; updated immediately before the frame signal.
+    ResearchFrame deliveredResearchFrame() const { return m_deliveredResearchFrame; }
 
 signals:
     /**
@@ -134,7 +137,7 @@ private:
     void stopRtspStream();
 
     /// @brief 同一会话内覆盖最新帧并登记一次 GUI 通知。
-    void publishRtspFrame(cv::Mat frame, quint64 sessionId);
+    void publishRtspFrame(cv::Mat frame, quint64 sessionId, qint64 receivedUs = -1, int rotation = -1);
 
     /// @brief RTSP 后台取流线程主循环；退出时把 finished 置为 true
     void rtspWorkerLoop(const QString &url, quint64 sessionId,
@@ -169,6 +172,8 @@ private:
 
     std::mutex m_rtspMatMutex;              ///< RTSP 帧高速保护锁
     cv::Mat m_latestRtspMat;                ///< 最新的 RTSP 画面帧
+    ResearchFrame m_latestResearchFrame, m_deliveredResearchFrame;
+    std::atomic<quint64> m_researchFrameSeq{0};
     std::atomic<bool> m_hasNewRtspMat{false}; ///< 是否有未消费的最新帧
     std::atomic<bool> m_rtspDispatchPending{false}; ///< 是否已有待处理的分发通知
 

@@ -133,23 +133,36 @@ void CameraManager::stopRtspStream()
 void CameraManager::notifyNewMat(quint64 sessionId)
 {
     cv::Mat mat;
+    ResearchFrame stamp;
     {
         std::lock_guard<std::mutex> lock(m_rtspMatMutex);
         if (sessionId != m_rtspSessionId.load()) return;
         m_rtspDispatchPending.store(false, std::memory_order_release);
         if (!m_hasNewRtspMat.load(std::memory_order_acquire)) return;
         mat = m_latestRtspMat;
+        stamp = m_latestResearchFrame;
         m_hasNewRtspMat.store(false, std::memory_order_release);
     }
     if (!mat.empty() && sessionId == m_rtspSessionId.load()) {
+        m_deliveredResearchFrame = stamp;
         emit matReady(mat);
     }
 }
 
-void CameraManager::publishRtspFrame(cv::Mat frame, quint64 sessionId)
+void CameraManager::publishRtspFrame(cv::Mat frame, quint64 sessionId, qint64 receivedUs, int rotation)
 {
     std::lock_guard<std::mutex> lock(m_rtspMatMutex);
     if (!m_rtspRunning.load() || sessionId != m_rtspSessionId.load()) return;
+    if (ResearchTrace::enabled()) {
+        m_latestResearchFrame = {++m_researchFrameSeq, sessionId,
+            receivedUs >= 0 ? receivedUs : ResearchTrace::nowUs(), -1,
+            rotation >= 0 ? rotation : m_rotationMode.load()};
+        auto fields = m_latestResearchFrame.json();
+        fields.insert("width", frame.cols); fields.insert("height", frame.rows);
+        fields.insert("source", "opencv_rtsp_after_retrieve");
+        fields.insert("overwrote_pending", m_hasNewRtspMat.load());
+        ResearchTrace::record("frame", fields);
+    }
     m_latestRtspMat = std::move(frame);
     m_hasNewRtspMat.store(true, std::memory_order_release);
     // 发布、旧会话作废和通知登记使用同一把锁，防止关闭后旧通知挡住新流。
@@ -290,6 +303,7 @@ void CameraManager::rtspWorkerLoop(const QString &url, quint64 sessionId,
         if (!cap.retrieve(frame) || frame.empty()) {
             continue;
         }
+        const qint64 researchReceivedUs = ResearchTrace::enabled() ? ResearchTrace::nowUs() : -1;
 
         if (sessionId != m_rtspSessionId.load()) break;
 
@@ -347,7 +361,7 @@ void CameraManager::rtspWorkerLoop(const QString &url, quint64 sessionId,
 
         if (sessionId != m_rtspSessionId.load()) break;
 
-        publishRtspFrame(std::move(frame), sessionId);
+        publishRtspFrame(std::move(frame), sessionId, researchReceivedUs, rot);
     }
 
     cap.release();
@@ -490,6 +504,14 @@ void CameraManager::onCameraErrorOccurred(QCamera::Error error, const QString &e
 
 void CameraManager::handleNewVideoFrame(const QVideoFrame &frame)
 {
+    if (frame.isValid() && ResearchTrace::enabled()) {
+        m_deliveredResearchFrame = {++m_researchFrameSeq, m_rtspSessionId.load(),
+            ResearchTrace::nowUs(), frame.startTime(), m_rotationMode.load()};
+        auto fields = m_deliveredResearchFrame.json();
+        fields.insert("width", frame.width()); fields.insert("height", frame.height());
+        fields.insert("source", "qt_video_sink_presentation_pts_not_capture");
+        ResearchTrace::record("frame", fields);
+    }
     m_lastFrameTime = QDateTime::currentMSecsSinceEpoch();
     if (m_cameraState == CameraState::Opening) {
         m_cameraState = CameraState::Open;

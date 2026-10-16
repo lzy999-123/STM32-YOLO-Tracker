@@ -428,12 +428,13 @@ MainWindow::~MainWindow()
     ui = nullptr;
 }
 
-void MainWindow::dispatchTrackingFrame(const cv::Mat &frame)
+void MainWindow::dispatchTrackingFrame(const cv::Mat &frame, const ResearchFrame &stamp)
 {
     if (frame.empty()) return;
 
     std::unique_lock<std::mutex> lock(m_trackingWorkerMutex);
     m_pendingTrackingFrame = frame;
+    m_pendingTrackingResearchFrame = stamp;
 
     if (m_trackingWorkerRunning.load(std::memory_order_acquire)) {
         return;
@@ -453,6 +454,7 @@ void MainWindow::trackingWorkerLoop()
 {
     for (;;) {
         cv::Mat frame;
+        ResearchFrame stamp;
         {
             std::lock_guard<std::mutex> lock(m_trackingWorkerMutex);
             if (m_pendingTrackingFrame.empty()) {
@@ -460,12 +462,13 @@ void MainWindow::trackingWorkerLoop()
                 return;
             }
             frame = m_pendingTrackingFrame;
+            stamp = m_pendingTrackingResearchFrame;
             m_pendingTrackingFrame.release();
         }
 
         // CSRT/ORB 可能耗时数十毫秒，放在这里执行不会阻塞 Qt GUI 重绘。
         m_trackingEngine.setFrameSize(QSize(frame.cols, frame.rows));
-        m_trackingEngine.processFrame(frame);
+        m_trackingEngine.processFrame(frame, stamp);
     }
 }
 
@@ -523,6 +526,10 @@ void MainWindow::flushTrackData()
     }
     m_trackFlushTimer.stop();
     const QPoint offsets = controlOffsets();
+    if (ResearchTrace::enabled())
+        ResearchTrace::record("control_request", {{"generation", qint64(m_trackingEngine.trackingGeneration())},
+            {"result_seq", qint64(m_lastTrackResultSeq)}, {"x", offsets.x()}, {"y", offsets.y()},
+            {"unit", "pixel_offset"}, {"physical_execution_time_us", QJsonValue::Null}});
     if (trackingDiagnosticsEnabled())
         qInfo("[TrackTrace] kind=send t=%lld generation=%llu result=%llu x=%d y=%d",
               trackingClockMs(), m_trackingEngine.trackingGeneration(), m_lastTrackResultSeq,
@@ -928,6 +935,7 @@ void MainWindow::handleNewVideoFrame(const QVideoFrame &frame)
     {
         QMutexLocker locker(&m_pendingFrameMutex);
         m_pendingVideoFrame = frame;
+        m_pendingVideoResearchFrame = m_cameraManager.deliveredResearchFrame();
         if (!m_frameDispatchPending) {
             m_frameDispatchPending = true;
             shouldDispatch = true;
@@ -948,6 +956,7 @@ void MainWindow::handleNewMatFrame(const cv::Mat &mat)
     {
         QMutexLocker locker(&m_pendingFrameMutex);
         m_pendingMat = mat;
+        m_pendingMatResearchFrame = m_cameraManager.deliveredResearchFrame();
         m_hasPendingMat = true;
         if (!m_frameDispatchPending) {
             m_frameDispatchPending = true;
@@ -978,18 +987,22 @@ void MainWindow::processLatestVideoFrame()
     });
 
     cv::Mat cvMat;
+    ResearchFrame researchFrame;
     {
         QMutexLocker locker(&m_pendingFrameMutex);
         if (m_hasPendingMat) {
             cvMat = m_pendingMat;
+            researchFrame = m_pendingMatResearchFrame;
             m_hasPendingMat = false;
         } else if (m_pendingVideoFrame.isValid()) {
             QVideoFrame frame = m_pendingVideoFrame;
+            researchFrame = m_pendingVideoResearchFrame;
             m_pendingVideoFrame = QVideoFrame();
             try {
                 cvMat = QVideoFrameToCvMat(frame);
                 if (!cvMat.empty()) {
                     const int rot = static_cast<int>(m_cameraManager.rotationMode());
+                    researchFrame.rotation = rot;
                     if (rot == 1) {
                         cv::flip(cvMat, cvMat, -1);
                     } else if (rot == 2) {
@@ -1164,10 +1177,10 @@ void MainWindow::processLatestVideoFrame()
     // YOLO 本身已经在 DnnThread 中异步执行；CSRT/ORB 的更新则交给单独线程，
     // 否则 setPixmap 之后 GUI 仍会被同步跟踪计算挡住，屏幕实际重绘会继续延迟。
     if (m_isCapturing && isFeatureTrackingSelected()) {
-        dispatchTrackingFrame(cvMat);
+        dispatchTrackingFrame(cvMat, researchFrame);
     } else {
         m_trackingEngine.setFrameSize(QSize(cvMat.cols, cvMat.rows));
-        m_trackingEngine.processFrame(cvMat);
+        m_trackingEngine.processFrame(cvMat, researchFrame);
     }
     if (m_cameraManager.state() != CameraManager::CameraState::Open) return;
 

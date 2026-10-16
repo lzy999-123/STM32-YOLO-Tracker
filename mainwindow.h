@@ -128,7 +128,7 @@ private:
     void updateTrackingControlAvailability();
 
     /// @brief 将特征跟踪帧交给独立线程，始终只保留最新帧
-    void dispatchTrackingFrame(const cv::Mat &frame);
+    void dispatchTrackingFrame(const cv::Mat &frame, const ResearchFrame &stamp = {});
 
     /// @brief 等待后台特征跟踪帧处理结束
     void waitForTrackingWorker();
@@ -163,6 +163,7 @@ private:
     cv::Mat m_lastFrame;                     ///< 转换后的 OpenCV 图像缓存
     QMutex m_pendingFrameMutex;              ///< 线程安全保护锁
     QVideoFrame m_pendingVideoFrame;         ///< 缓存未处理的最新的视频帧
+    ResearchFrame m_pendingVideoResearchFrame, m_pendingMatResearchFrame;
     cv::Mat m_pendingMat;                    ///< 缓存未处理的最新的 cv::Mat（用于 RTSP 高性能零拷贝通道）
     bool m_hasPendingMat = false;            ///< 是否有待处理的 cv::Mat
     bool m_frameDispatchPending = false;     ///< 是否有待调度的视频帧
@@ -211,6 +212,7 @@ private:
     // CSRT/ORB 更新可能超过一帧周期，不能阻塞 GUI 线程。这里采用单线程、最新帧覆盖策略。
     std::mutex m_trackingWorkerMutex;
     cv::Mat m_pendingTrackingFrame;
+    ResearchFrame m_pendingTrackingResearchFrame;
     std::thread m_trackingWorker;
     std::atomic<bool> m_trackingWorkerRunning{false};
     void trackingWorkerLoop();

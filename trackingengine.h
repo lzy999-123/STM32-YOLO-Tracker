@@ -57,7 +57,7 @@ public:
      * @brief 送入新的视频帧进行追踪计算
      * @param frame 新的画面帧
      */
-    void processFrame(const cv::Mat &frame);
+    void processFrame(const cv::Mat &frame, const ResearchFrame &stamp = {});
     
     /// @brief 动态更新画面尺寸（防止追踪框越界）
     void setFrameSize(const QSize &size);

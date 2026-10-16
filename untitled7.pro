@@ -18,6 +18,8 @@ HEADERS += \
     luckfoxnetworkroute.h \
     yoloinputgeometry.h \
     trackingdiagnostics.h \
+    researchtrace.h \
+    researchframe.h \
     mainwindow.h \
     luckfoxdiscovery.h \
     networkcontroller.h \

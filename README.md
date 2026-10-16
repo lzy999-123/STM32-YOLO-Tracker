@@ -22,6 +22,8 @@
 
 ## 学习记录与项目总结
 
+论文方法实施的第一阶段已提供默认关闭的旁路日志、离线完整性检查、候选相机标定与静止目标近似 LOS 工具，见 [阶段一数据与标定说明](docs/research/STAGE1_DATA_AND_CALIBRATION.md)。当前缺少源采样时间和实物标定证据，工具不声明同步验证或抗遮挡性能通过；正式程序不自动替换。
+
 每次提交都同步保存一份学习报告，记录完成的工作、学到的知识、故障与解决过程、验证结果和以后需要注意的事项。
 报告索引见 [docs/learning](docs/learning/README.md)，首份报告覆盖Luckfox无线视频与自动识别阶段。
 项目全部完成后，依据历次报告填写 [项目最终总结](docs/learning/PROJECT_SUMMARY.md)。持续维护约定见 [AGENTS.md](AGENTS.md)。

@@ -81,6 +81,7 @@ private:
     qint64 m_lastTelemetry = -2000;
     qint64 m_lastCommand = 0;
     quint32 m_lastTelemetrySequence = 0;
+    quint64 m_researchConnection = 0;
     int m_flags = 0;
     bool m_connected = false;
     bool m_online = false;
